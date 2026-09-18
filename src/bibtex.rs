@@ -1,36 +1,41 @@
 //! BibTeX rendering for parsed bibliographic records.
 //!
-//! GROBID itself can return BibTeX (via the `Accept: application/x-bibtex`
-//! header on some services); these helpers instead render the strongly
-//! typed [`crate::tei::Biblio`] records client-side, mirroring the
-//! client-side converters of the Python GROBID client. They are used by the
-//! `pdf2bibtex` and `refs2bibtex` examples.
+//! This module adapts the strongly typed [`crate::tei::Biblio`] records onto
+//! the [`biblatex`] crate, which handles BibTeX/BibLaTeX parsing, writing
+//! and field typing. Using a full-fidelity BibTeX library (instead of
+//! hand-rolled string formatting) gives proper escaping, typed person lists
+//! and dates, and opens the door to reading back `.bib` files — e.g. for
+//! deduplicating or correcting references.
+//!
+//! The `pdf2bibtex` and `refs2bibtex` examples use these helpers.
 
 use std::collections::HashSet;
 
+use biblatex::{Chunk, Date, DateValue, Datetime, Entry, EntryType, Person, Spanned};
+
 use crate::tei::{Author, Biblio};
 
-/// Pick a BibTeX entry type based on the available metadata.
+/// Pick a BibLaTeX entry type based on the available metadata.
 ///
-/// * `article` for journal articles,
-/// * `incollection` for chapters in a book,
-/// * `inproceedings` for conference series papers,
-/// * `techreport` for records with an issuing institution,
-/// * `book` for records with a publisher,
-/// * `misc` otherwise.
-pub fn entry_type(biblio: &Biblio) -> &'static str {
+/// * [`EntryType::Article`] for journal articles,
+/// * [`EntryType::InCollection`] for chapters in a book,
+/// * [`EntryType::InProceedings`] for conference series papers,
+/// * [`EntryType::TechReport`] for records with an issuing institution,
+/// * [`EntryType::Book`] for records with a publisher,
+/// * [`EntryType::Misc`] otherwise.
+pub fn entry_type(biblio: &Biblio) -> EntryType {
     if biblio.journal.is_some() {
-        "article"
+        EntryType::Article
     } else if biblio.book_title.is_some() {
-        "incollection"
+        EntryType::InCollection
     } else if biblio.series_title.is_some() {
-        "inproceedings"
+        EntryType::InProceedings
     } else if biblio.institution.is_some() {
-        "techreport"
+        EntryType::TechReport
     } else if biblio.publisher.is_some() {
-        "book"
+        EntryType::Book
     } else {
-        "misc"
+        EntryType::Misc
     }
 }
 
@@ -90,72 +95,130 @@ pub fn unique_key(biblio: &Biblio, used: &mut HashSet<String>) -> String {
     }
 }
 
+/// Convert a bibliographic record into a typed BibLaTeX entry.
+///
+/// Authors and editors become typed person lists, the GROBID date (year,
+/// year-month or year-month-day) becomes a typed date, and the remaining
+/// fields become plain text values. The returned entry can be serialized
+/// with [`Entry::to_bibtex_string`], inspected with the typed getters, or
+/// inserted into a [`biblatex::Bibliography`].
+pub fn to_entry(key: &str, biblio: &Biblio) -> Entry {
+    let mut entry = Entry::new(key.to_string(), entry_type(biblio));
+
+    let authors = persons(&biblio.authors);
+    if !authors.is_empty() {
+        entry.set_as("author", &authors);
+    }
+    let editors = persons(&biblio.editors);
+    if !editors.is_empty() {
+        entry.set_as("editor", &editors);
+    }
+    for (name, value) in [
+        ("title", &biblio.title),
+        ("booktitle", &biblio.book_title),
+        ("journaltitle", &biblio.journal),
+        ("series", &biblio.series_title),
+        ("volume", &biblio.volume),
+        ("number", &biblio.issue),
+        ("pages", &biblio.pages),
+        ("publisher", &biblio.publisher),
+        ("institution", &biblio.institution),
+        ("doi", &biblio.doi),
+        ("url", &biblio.url),
+        ("issn", &biblio.issn),
+        ("note", &biblio.note),
+    ] {
+        set_text(&mut entry, name, value);
+    }
+    if let Some(date) = date(&biblio.date) {
+        entry.set_as("date", &date);
+    }
+    entry
+}
+
 /// Render one record as a BibTeX entry.
 pub fn format_entry(key: &str, biblio: &Biblio) -> String {
-    let mut lines = vec![format!("@{}{{{key},", entry_type(biblio))];
-    if let Some(names) = format_names(&biblio.authors) {
-        lines.push(format!("  author = {{{names}}},"));
-    }
-    if let Some(names) = format_names(&biblio.editors) {
-        lines.push(format!("  editor = {{{names}}},"));
-    }
-    field(&mut lines, "title", &biblio.title);
-    field(&mut lines, "booktitle", &biblio.book_title);
-    field(&mut lines, "journal", &biblio.journal);
-    field(&mut lines, "series", &biblio.series_title);
-    field(&mut lines, "year", &year(biblio));
-    field(&mut lines, "volume", &biblio.volume);
-    field(&mut lines, "number", &biblio.issue);
-    field(&mut lines, "pages", &biblio.pages);
-    field(&mut lines, "publisher", &biblio.publisher);
-    field(&mut lines, "institution", &biblio.institution);
-    field(&mut lines, "doi", &biblio.doi);
-    field(&mut lines, "url", &biblio.url);
-    field(&mut lines, "issn", &biblio.issn);
-    field(&mut lines, "note", &biblio.note);
-    lines.push("}".to_string());
-    lines.join("\n")
+    to_entry(key, biblio)
+        .to_bibtex_string()
+        .expect("entries built from typed values always serialize")
 }
 
-/// Format authors or editors as `Surname, Given and ...`.
-pub fn format_names(names: &[Author]) -> Option<String> {
-    if names.is_empty() {
-        return None;
-    }
-    let formatted: Vec<String> = names.iter().filter_map(format_name).collect();
-    if formatted.is_empty() {
-        None
-    } else {
-        Some(formatted.join(" and "))
-    }
+/// Map GROBID authors onto typed BibLaTeX persons. Middle names are folded
+/// into the given name; authors with neither surname nor full name are
+/// dropped.
+fn persons(authors: &[Author]) -> Vec<Person> {
+    authors.iter().filter_map(person).collect()
 }
 
-fn format_name(author: &Author) -> Option<String> {
-    let surname = author.surname.as_deref().unwrap_or_default();
+fn person(author: &Author) -> Option<Person> {
     let given = [author.given_name.as_deref(), author.middle_name.as_deref()]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>()
         .join(" ");
-    if surname.is_empty() {
-        author.full_name.clone().filter(|name| !name.is_empty())
-    } else if given.is_empty() {
-        Some(surname.to_string())
-    } else {
-        Some(format!("{surname}, {given}"))
-    }
+    let name = author
+        .surname
+        .as_deref()
+        .filter(|surname| !surname.is_empty())
+        .map(str::to_string)
+        .or_else(|| author.full_name.clone().filter(|n| !n.is_empty()))?;
+    Some(Person {
+        name,
+        given_name: given,
+        prefix: String::new(),
+        suffix: String::new(),
+        id: None,
+        prefix_initials: None,
+        given_initials: None,
+        use_prefix: None,
+    })
 }
 
-/// Add a BibTeX field line when the value is present and non-empty.
-fn field(lines: &mut Vec<String>, name: &str, value: &Option<String>) {
+/// Parse a GROBID date (`YYYY`, `YYYY-MM` or `YYYY-MM-DD`) into a typed
+/// BibLaTeX date. Dates without at least a four-digit year are dropped.
+fn date(date: &Option<String>) -> Option<Date> {
+    let raw = date.as_deref()?;
+    let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).take(8).collect();
+    let year = digits.get(0..4)?.parse::<i32>().ok()?;
+    let month = digits
+        .get(4..6)
+        .and_then(|m| m.parse::<u8>().ok())
+        .filter(|m| (1..=12).contains(m))
+        .map(|m| m - 1);
+    let day = match month {
+        Some(_) => digits
+            .get(6..8)
+            .and_then(|d| d.parse::<u8>().ok())
+            .filter(|d| (1..=31).contains(d))
+            .map(|d| d - 1),
+        None => None,
+    };
+    Some(Date {
+        value: DateValue::At(Datetime {
+            year,
+            month,
+            day,
+            time: None,
+        }),
+        uncertain: false,
+        approximate: false,
+    })
+}
+
+/// Set a field from a plain-text value, when present and non-empty.
+fn set_text(entry: &mut Entry, name: &str, value: &Option<String>) {
     if let Some(value) = value.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
-        lines.push(format!("  {name} = {{{value}}},"));
+        entry.set(
+            name,
+            vec![Spanned::detached(Chunk::Normal(value.to_string()))],
+        );
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use biblatex::ChunksExt;
 
     fn author(surname: &str, given: Option<&str>) -> Author {
         Author {
@@ -202,30 +265,64 @@ mod tests {
                 journal: Some("X".to_string()),
                 ..Biblio::default()
             }),
-            "article"
+            EntryType::Article
         );
         assert_eq!(
             entry_type(&Biblio {
                 book_title: Some("X".to_string()),
                 ..Biblio::default()
             }),
-            "incollection"
+            EntryType::InCollection
         );
         assert_eq!(
             entry_type(&Biblio {
                 institution: Some("X".to_string()),
                 ..Biblio::default()
             }),
-            "techreport"
+            EntryType::TechReport
         );
         assert_eq!(
             entry_type(&Biblio {
                 publisher: Some("X".to_string()),
                 ..Biblio::default()
             }),
-            "book"
+            EntryType::Book
         );
-        assert_eq!(entry_type(&Biblio::default()), "misc");
+        assert_eq!(entry_type(&Biblio::default()), EntryType::Misc);
+    }
+
+    #[test]
+    fn test_to_entry() {
+        let mut biblio = Biblio::default();
+        biblio.authors.push(author("Kahle", Some("Brewster")));
+        biblio.authors.push(author("Doe", Some("J")));
+        biblio.title = Some("Dummy Example File".to_string());
+        biblio.journal = Some("Letters in the Alphabet".to_string());
+        biblio.date = Some("2000-03-01".to_string());
+        biblio.volume = Some("20".to_string());
+        biblio.doi = Some("10.1234/example".to_string());
+
+        let entry = to_entry("kahle2000", &biblio);
+        assert_eq!(entry.entry_type, EntryType::Article);
+        // The typed values round-trip through the field chunks.
+        let authors: Vec<Person> = entry.get_as("author").expect("typed authors");
+        assert_eq!(authors.len(), 2);
+        assert_eq!(authors[0].name, "Kahle");
+        assert_eq!(authors[0].given_name, "Brewster");
+        let date: biblatex::Date = entry.get_as("date").expect("typed date");
+        assert_eq!(
+            date.value,
+            DateValue::At(Datetime {
+                year: 2000,
+                month: Some(2),
+                day: Some(0),
+                time: None,
+            })
+        );
+        assert_eq!(
+            entry.get("doi").expect("doi").format_verbatim(),
+            "10.1234/example"
+        );
     }
 
     #[test]
@@ -243,7 +340,52 @@ mod tests {
         assert!(entry.contains("title = {Dummy Example File},"));
         assert!(entry.contains("year = {2000},"));
         assert!(entry.contains("volume = {20},"));
-        assert!(entry.ends_with("\n}"));
+        assert!(entry.ends_with('}'));
+    }
+
+    #[test]
+    fn test_roundtrip() {
+        // Entries rendered to a .bib file must parse back into the same
+        // typed values - the foundation for reading and deduplicating
+        // references in the future.
+        let mut biblio = Biblio::default();
+        biblio.authors.push(author("Milašauskienė", Some("Žemyna")));
+        biblio.title = Some("Dummy & \"quoted\" Example".to_string());
+        biblio.journal = Some("A Journal".to_string());
+        biblio.date = Some("2003-06-15".to_string());
+        let key = unique_key(&biblio, &mut HashSet::new());
+        let bibtex = format_entry(&key, &biblio);
+
+        let bibliography = biblatex::Bibliography::parse(&bibtex).expect("parse output");
+        let entry = bibliography.get(&key).expect("entry by key");
+        assert_eq!(entry.entry_type, EntryType::Article);
+        let authors: Vec<Person> = entry.get_as("author").expect("typed authors");
+        assert_eq!(authors[0].name, "Milašauskienė");
+        assert_eq!(authors[0].given_name, "Žemyna");
+        // The BibTeX writer expands the date into year/month/day fields;
+        // the typed getter falls back to them.
+        let date = entry.date().expect("typed date");
+        match date {
+            biblatex::PermissiveType::Typed(date) => {
+                assert_eq!(
+                    date.value,
+                    DateValue::At(Datetime {
+                        year: 2003,
+                        month: Some(5),
+                        day: Some(14),
+                        time: None,
+                    })
+                );
+            }
+            other => panic!("expected typed date, got {other:?}"),
+        }
+        assert_eq!(
+            entry.get("title").expect("title").format_verbatim(),
+            "Dummy & \"quoted\" Example"
+        );
+        // The escaped characters must have survived the round trip.
+        assert!(bibtex.contains("&"));
+        assert!(bibtex.contains("quoted"));
     }
 
     #[test]

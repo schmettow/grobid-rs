@@ -170,10 +170,12 @@ reported on stderr and skipped, and an unresponsive server is detected by a
 liveness probe with bounded retries and a clear error message. Entry types
 (`@article`, `@incollection`, `@techreport`, `@book`, `@misc`) and keys
 (first author surname + year, deduplicated) are derived from the parsed
-metadata via the `grobid::bibtex` helpers. `refs2bibtex` skips empty parse
-results and drops references with a duplicate DOI, and supports reference
-consolidation against CrossRef with `-c/--consolidate`. Run either example
-with `--help` for all options.
+metadata via the `grobid::bibtex` helpers, which render records as typed
+BibLaTeX entries using the [`biblatex`](https://crates.io/crates/biblatex)
+crate (proper escaping, typed person lists and dates). `refs2bibtex` skips
+empty parse results and drops references with a duplicate DOI, and supports
+reference consolidation against CrossRef with `-c/--consolidate`. Run either
+example with `--help` for all options.
 
 ## Requirements
 
