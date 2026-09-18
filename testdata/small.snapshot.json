@@ -1,0 +1,105 @@
+{
+  "grobid_version": "0.5.1-SNAPSHOT",
+  "grobid_timestamp": "2018-04-02T00:31+0000",
+  "language": "en",
+  "header": {
+    "authors": [
+      {
+        "full_name": "Brewster Kahle",
+        "given_name": "Brewster",
+        "surname": "Kahle",
+        "affiliation": {
+          "institution": "Technion-Israel Institute of Technology",
+          "department": "Faculty ofAgricultrial Engineering",
+          "laboratory": "Plant Physiology Laboratory",
+          "address": {
+            "post_code": "32000",
+            "settlement": "Haifa",
+            "country": "Israel"
+          }
+        }
+      },
+      {
+        "full_name": "J Doe",
+        "given_name": "J",
+        "surname": "Doe"
+      }
+    ],
+    "date": "2000",
+    "title": "Dummy Example File",
+    "book_title": "Dummy Example File. Journal of Fake News. pp. 1-2. ISSN 1234-5678"
+  },
+  "abstract_text": "Everything you ever wanted to know about nothing",
+  "body": [
+    {
+      "head": "Introduction",
+      "number": "1",
+      "blocks": [
+        {
+          "kind": "paragraph",
+          "text": "Everything starts somewhere, as somebody [1] once said.",
+          "markers": [
+            {
+              "kind": "bibr",
+              "target": "#b0",
+              "label": "[1]"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "head": "In Depth",
+      "number": "2"
+    },
+    {
+      "head": "Meat",
+      "number": "2.1",
+      "blocks": [
+        {
+          "kind": "paragraph",
+          "text": "You know, for kids."
+        }
+      ]
+    },
+    {
+      "head": "Potatos",
+      "number": "2.2",
+      "blocks": [
+        {
+          "kind": "paragraph",
+          "text": "QED."
+        }
+      ]
+    }
+  ],
+  "citations": [
+    {
+      "index": 0,
+      "authors": [
+        {
+          "full_name": "A Seaperson",
+          "middle_name": "A",
+          "surname": "Seaperson"
+        }
+      ],
+      "id": "b0",
+      "date": "2001",
+      "title": "Everything is Wonderful",
+      "journal": "Letters in the Alphabet",
+      "volume": "20",
+      "pages": "1-11",
+      "first_page": "1",
+      "last_page": "11"
+    },
+    {
+      "index": 1,
+      "id": "b1",
+      "date": "2011-03-28",
+      "title": "All about Facts",
+      "journal": "The Dictionary",
+      "volume": "14",
+      "note": "author signed copy"
+    }
+  ]
+}
