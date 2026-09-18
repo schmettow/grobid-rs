@@ -142,6 +142,21 @@ the first page numbered 1. See the
 [GROBID documentation](https://grobid.readthedocs.io/en/latest/Coordinates-in-PDF/)
 for details.
 
+## Example: pdf2bibtex
+
+The `pdf2bibtex` example processes all PDFs in a directory and writes the
+extracted bibliographic metadata as a BibTeX file:
+
+```sh
+cargo run --release --example pdf2bibtex -- ~/papers -s http://localhost:8070
+```
+
+PDFs are discovered recursively and processed with a bounded number of
+concurrent requests (`-w`, default 4); per-document failures are reported on
+stderr and skipped. Entry types (`@article`, `@incollection`, `@techreport`,
+`@book`, `@misc`) and keys (first author surname + year, deduplicated) are
+derived from the parsed metadata. Run with `--help` for all options.
+
 ## Requirements
 
 - Rust 1.85+
