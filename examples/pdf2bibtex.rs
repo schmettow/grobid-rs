@@ -13,12 +13,14 @@
 //! entry is written per document. Documents that fail to process are
 //! reported on stderr and skipped.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use grobid::{Author, Biblio, Error, GrobidClient, PdfInput, ProcessOptions, RetryPolicy};
+use grobid::bibtex;
+use grobid::{Biblio, Error, GrobidClient, PdfInput, ProcessOptions, RetryPolicy};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -268,143 +270,22 @@ fn collect_pdfs(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 
 /// Assign unique BibTeX keys and format all entries, sorted by key.
 fn format_entries(results: &[(PathBuf, Biblio)]) -> Vec<(PathBuf, String)> {
+    // Sort by suggested key (and path, for determinism) before assigning
+    // collision-free keys.
     let mut keyed: Vec<(&Biblio, &PathBuf, String)> = results
         .iter()
-        .map(|(path, biblio)| (biblio, path, bibtex_key(biblio)))
+        .map(|(path, biblio)| (biblio, path, bibtex::suggest_key(biblio)))
         .collect();
     keyed.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.1.cmp(b.1)));
 
-    let mut previous: Option<String> = None;
-    let mut suffix = 0usize;
-    let mut entries = Vec::with_capacity(keyed.len());
-    for (biblio, path, base) in keyed {
-        if previous.as_deref() == Some(base.as_str()) {
-            suffix += 1;
-        } else {
-            suffix = 0;
-        }
-        let key = if suffix == 0 {
-            base.clone()
-        } else {
-            format!("{base}-{}", suffix + 1)
-        };
-        previous = Some(key.clone());
-        entries.push((path.clone(), format_entry(&key, biblio)));
-    }
-    entries
-}
-
-/// Derive a BibTeX key from the first author's surname and the publication
-/// year, e.g. `Kahle2000`. Falls back to `ref` (made unique by the suffix
-/// logic in [`format_entries`]) when neither is known.
-fn bibtex_key(biblio: &Biblio) -> String {
-    let surname = biblio
-        .authors
-        .first()
-        .and_then(|author| author.surname.as_deref())
-        .unwrap_or_default();
-    let base = format!("{surname}{}", year(biblio).unwrap_or_default());
-    let key: String = base.chars().filter(char::is_ascii_alphanumeric).collect();
-    if key.is_empty() {
-        "ref".to_string()
-    } else {
-        key
-    }
-}
-
-/// Pick a BibTeX entry type based on the available metadata.
-fn entry_type(biblio: &Biblio) -> &'static str {
-    if biblio.journal.is_some() {
-        "article"
-    } else if biblio.book_title.is_some() {
-        "incollection"
-    } else if biblio.series_title.is_some() {
-        "inproceedings"
-    } else if biblio.institution.is_some() {
-        "techreport"
-    } else if biblio.publisher.is_some() {
-        "book"
-    } else {
-        "misc"
-    }
-}
-
-/// Extract the publication year (first four digits) from the date.
-fn year(biblio: &Biblio) -> Option<String> {
-    let date = biblio.date.as_deref()?;
-    let digits: String = date
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .take(4)
-        .collect();
-    if digits.is_empty() {
-        None
-    } else {
-        Some(digits)
-    }
-}
-
-/// Format one entry in BibTeX syntax.
-fn format_entry(key: &str, biblio: &Biblio) -> String {
-    let mut lines = vec![format!("@{}{{{key},", entry_type(biblio))];
-    if let Some(names) = format_names(&biblio.authors) {
-        lines.push(format!("  author = {{{names}}},"));
-    }
-    if let Some(names) = format_names(&biblio.editors) {
-        lines.push(format!("  editor = {{{names}}},"));
-    }
-    field(&mut lines, "title", &biblio.title);
-    field(&mut lines, "booktitle", &biblio.book_title);
-    field(&mut lines, "journal", &biblio.journal);
-    field(&mut lines, "series", &biblio.series_title);
-    field(&mut lines, "year", &year(biblio));
-    field(&mut lines, "volume", &biblio.volume);
-    field(&mut lines, "number", &biblio.issue);
-    field(&mut lines, "pages", &biblio.pages);
-    field(&mut lines, "publisher", &biblio.publisher);
-    field(&mut lines, "institution", &biblio.institution);
-    field(&mut lines, "doi", &biblio.doi);
-    field(&mut lines, "url", &biblio.url);
-    field(&mut lines, "issn", &biblio.issn);
-    field(&mut lines, "note", &biblio.note);
-    lines.push("}".to_string());
-    lines.join("\n")
-}
-
-/// Add a BibTeX field line when the value is present and non-empty.
-fn field(lines: &mut Vec<String>, name: &str, value: &Option<String>) {
-    if let Some(value) = value.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
-        lines.push(format!("  {name} = {{{value}}},"));
-    }
-}
-
-/// Format authors or editors as `Surname, Given and ...`.
-fn format_names(names: &[Author]) -> Option<String> {
-    if names.is_empty() {
-        return None;
-    }
-    let formatted: Vec<String> = names.iter().filter_map(format_name).collect();
-    if formatted.is_empty() {
-        None
-    } else {
-        Some(formatted.join(" and "))
-    }
-}
-
-fn format_name(author: &Author) -> Option<String> {
-    let surname = author.surname.as_deref().unwrap_or_default();
-    let given = [author.given_name.as_deref(), author.middle_name.as_deref()]
+    let mut used = HashSet::new();
+    keyed
         .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(" ");
-    if surname.is_empty() {
-        author.full_name.clone().filter(|name| !name.is_empty())
-    } else if given.is_empty() {
-        Some(surname.to_string())
-    } else {
-        Some(format!("{surname}, {given}"))
-    }
+        .map(|(biblio, path, _)| {
+            let key = bibtex::unique_key(biblio, &mut used);
+            (path.clone(), bibtex::format_entry(&key, biblio))
+        })
+        .collect()
 }
 
 fn parse_args() -> Result<Option<Args>, String> {
@@ -506,102 +387,12 @@ mod tests {
     }
 
     #[test]
-    fn test_bibtex_key() {
-        let mut biblio = Biblio::default();
-        biblio.authors.push(Author {
-            surname: Some("Milašauskienė".to_string()),
-            ..Author::default()
-        });
-        biblio.date = Some("2003".to_string());
-        assert_eq!(bibtex_key(&biblio), "Milaauskien2003");
-
-        // Without author and date the key falls back to "ref"; uniqueness
-        // is handled by the suffix logic in format_entries.
-        assert_eq!(bibtex_key(&Biblio::default()), "ref");
-    }
-
-    #[test]
-    fn test_year() {
-        for (date, want) in [
-            (Some("2019-01-30".to_string()), Some("2019")),
-            (Some("2003".to_string()), Some("2003")),
-            (Some("no digits".to_string()), None),
-            (None, None),
-        ] {
-            let biblio = Biblio {
-                date,
-                ..Biblio::default()
-            };
-            assert_eq!(year(&biblio).as_deref(), want);
-        }
-    }
-
-    #[test]
-    fn test_entry_type() {
-        assert_eq!(
-            entry_type(&Biblio {
-                journal: Some("X".to_string()),
-                ..Biblio::default()
-            }),
-            "article"
-        );
-        assert_eq!(
-            entry_type(&Biblio {
-                book_title: Some("X".to_string()),
-                ..Biblio::default()
-            }),
-            "incollection"
-        );
-        assert_eq!(
-            entry_type(&Biblio {
-                institution: Some("X".to_string()),
-                ..Biblio::default()
-            }),
-            "techreport"
-        );
-        assert_eq!(
-            entry_type(&Biblio {
-                publisher: Some("X".to_string()),
-                ..Biblio::default()
-            }),
-            "book"
-        );
-        assert_eq!(entry_type(&Biblio::default()), "misc");
-    }
-
-    #[test]
-    fn test_format_entry() {
-        let mut biblio = Biblio::default();
-        biblio.authors.push(Author {
-            given_name: Some("Brewster".to_string()),
-            surname: Some("Kahle".to_string()),
-            ..Author::default()
-        });
-        biblio.authors.push(Author {
-            given_name: Some("J".to_string()),
-            surname: Some("Doe".to_string()),
-            ..Author::default()
-        });
-        biblio.title = Some("Dummy Example File".to_string());
-        biblio.date = Some("2000".to_string());
-        biblio.volume = Some("20".to_string());
-
-        let entry = format_entry("kahle2000", &biblio);
-        assert!(entry.starts_with("@misc{kahle2000,"));
-        assert!(entry.contains("author = {Kahle, Brewster and Doe, J},"));
-        assert!(entry.contains("title = {Dummy Example File},"));
-        assert!(entry.contains("year = {2000},"));
-        assert!(entry.contains("volume = {20},"));
-        assert!(entry.ends_with("\n}"));
-    }
-
-    #[test]
     fn test_format_entries_unique_keys() {
         let make = |surname: &str| {
             let mut biblio = Biblio::default();
-            biblio.authors.push(Author {
+            biblio.authors.push(grobid::Author {
                 surname: Some(surname.to_string()),
-                ..Author::default()
+                ..grobid::Author::default()
             });
             biblio.date = Some("2020".to_string());
             biblio

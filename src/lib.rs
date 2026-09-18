@@ -71,6 +71,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod bibtex;
 mod client;
 mod error;
 pub mod tei;

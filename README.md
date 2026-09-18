@@ -142,20 +142,38 @@ the first page numbered 1. See the
 [GROBID documentation](https://grobid.readthedocs.io/en/latest/Coordinates-in-PDF/)
 for details.
 
-## Example: pdf2bibtex
+## Examples
+
+### pdf2bibtex
 
 The `pdf2bibtex` example processes all PDFs in a directory and writes the
-extracted bibliographic metadata as a BibTeX file:
+extracted bibliographic metadata as a BibTeX file, one entry per document
+(its header):
 
 ```sh
 cargo run --release --example pdf2bibtex -- ~/papers -s http://localhost:8070
 ```
 
-PDFs are discovered recursively and processed with a bounded number of
-concurrent requests (`-w`, default 4); per-document failures are reported on
-stderr and skipped. Entry types (`@article`, `@incollection`, `@techreport`,
-`@book`, `@misc`) and keys (first author surname + year, deduplicated) are
-derived from the parsed metadata. Run with `--help` for all options.
+### refs2bibtex
+
+The `refs2bibtex` example extracts the bibliographic *references* of all PDFs
+in a directory (via `/api/processReferences`) and writes one BibTeX entry per
+reference:
+
+```sh
+cargo run --release --example refs2bibtex -- ~/papers -s http://localhost:8070
+```
+
+Both examples discover PDFs recursively and process them with a bounded
+number of concurrent requests (`-w`, default 4); per-document failures are
+reported on stderr and skipped, and an unresponsive server is detected by a
+liveness probe with bounded retries and a clear error message. Entry types
+(`@article`, `@incollection`, `@techreport`, `@book`, `@misc`) and keys
+(first author surname + year, deduplicated) are derived from the parsed
+metadata via the `grobid::bibtex` helpers. `refs2bibtex` skips empty parse
+results and drops references with a duplicate DOI, and supports reference
+consolidation against CrossRef with `-c/--consolidate`. Run either example
+with `--help` for all options.
 
 ## Requirements
 
