@@ -194,11 +194,50 @@ empty parse results and drops references with a duplicate DOI, and supports
 reference consolidation against CrossRef with `-c/--consolidate`. Run either
 example with `--help` for all options.
 
+## The GROBID server
+
+This crate is a client only: all PDF parsing happens in a running
+[GROBID](https://grobid.readthedocs.io/) server, which is reached over its
+REST API. GROBID is a machine learning system that turns PDFs of scholarly
+articles into structured TEI XML — header metadata, body structure,
+references and optional PDF coordinates. The server preloads its models at
+startup and listens on port `8070` by default.
+
+The quickest way to get a server running is Docker, which is also the only
+supported option on Windows (GROBID itself is developed and tested on Linux
+and macOS). On `arm64` hosts the images run emulated and are considerably
+slower:
+
+| Platform | Installation instructions |
+| --- | --- |
+| Docker (any platform, recommended) | [Run with Docker](https://grobid.readthedocs.io/en/latest/Grobid-docker/) |
+| Linux | [Build from source](https://grobid.readthedocs.io/en/latest/Install-Grobid/) (JDK 21, then `./gradlew run`) |
+| macOS | [Build from source](https://grobid.readthedocs.io/en/latest/Install-Grobid/) (includes Homebrew JDK instructions) |
+| Windows (native) | Not supported by GROBID; use Docker or WSL instead, see [Windows related issues](https://grobid.readthedocs.io/en/latest/Frequently-asked-questions/#windows-related-issues) |
+
+To start a server with Docker — the `-crf` image is small (about 500 MB)
+and fast, the `-full` image (about 8 GB, GPU recommended) adds Deep Learning
+models that improve reference parsing:
+
+```sh
+# CRF models only
+docker run --rm --init --ulimit core=0 -p 8070:8070 grobid/grobid:0.9.1-crf
+
+# with Deep Learning models (add --gpus all on Linux to use a GPU)
+docker run --rm --init --ulimit core=0 -p 8070:8070 grobid/grobid:0.9.1-full
+```
+
+Once the container is up, `http://localhost:8070/api/isalive` returns `true`
+and the examples above work as shown. See the GROBID documentation for the
+[quick start](https://grobid.readthedocs.io/en/latest/getting_started/), the
+[REST API reference](https://grobid.readthedocs.io/en/latest/Grobid-service/)
+and the
+[troubleshooting guide](https://grobid.readthedocs.io/en/latest/Frequently-asked-questions/).
+
 ## Requirements
 
 - Rust 1.85+
-- A running [GROBID service](https://grobid.readthedocs.io/en/latest/Grobid-service/),
-  e.g. `docker run --rm -p 8070:8070 lfoppiano/grobid:0.9.1`
+- A running GROBID server, see *The GROBID server* above
 
 ## License
 
