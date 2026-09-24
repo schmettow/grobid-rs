@@ -33,6 +33,19 @@ pub const SERVICE_CITATION_LIST: &str = "processCitationList";
 /// Retry policy for requests that hit a busy GROBID server (HTTP 503 or
 /// 429). Retries are spaced with exponential backoff: the delay after the
 /// n-th attempt is `initial_delay * multiplier^n`, capped at `max_delay`.
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use grobid::RetryPolicy;
+///
+/// let policy = RetryPolicy {
+///     max_attempts: 3,
+///     initial_delay: Duration::from_secs(1),
+///     ..RetryPolicy::default()
+/// };
+/// assert_eq!(policy.max_attempts, 3);
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct RetryPolicy {
     /// Total number of attempts, including the first one. Must be at least 1.
@@ -120,6 +133,19 @@ impl CitationConsolidation {
 ///
 /// See <https://grobid.readthedocs.io/en/latest/Coordinates-in-PDF/> for the
 /// coordinate system and the `@coords` notation.
+///
+/// ```
+/// use grobid::{CoordinateElement, ProcessOptions};
+///
+/// let options = ProcessOptions {
+///     tei_coordinates: vec![CoordinateElement::Figure, CoordinateElement::Ref],
+///     ..ProcessOptions::default()
+/// };
+/// assert_eq!(options.tei_coordinates.len(), 2);
+///
+/// // The set requested by the Go GROBID client by default.
+/// assert_eq!(CoordinateElement::COMMON.len(), 5);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum CoordinateElement {
@@ -180,6 +206,21 @@ impl CoordinateElement {
 /// Defaults follow the GROBID server defaults and the official Python
 /// client: header consolidation enabled, citation consolidation and all
 /// other extras disabled.
+///
+/// ```
+/// use grobid::{CitationConsolidation, CoordinateElement, ProcessOptions};
+///
+/// let options = ProcessOptions {
+///     generate_ids: true,
+///     consolidate_citations: CitationConsolidation::Metadata,
+///     include_raw_citations: true,
+///     tei_coordinates: CoordinateElement::COMMON.to_vec(),
+///     segment_sentences: true,
+///     ..ProcessOptions::default()
+/// };
+/// assert!(options.generate_ids);
+/// assert_eq!(options.tei_coordinates.len(), 5);
+/// ```
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ProcessOptions {
     /// Generate unique identifiers for each text component
@@ -281,6 +322,20 @@ impl ProcessOptions {
 /// bytes with a file name. In-memory inputs avoid a round-trip through the
 /// filesystem, e.g. when the PDF was downloaded or comes from an object
 /// store.
+///
+/// ```
+/// use std::path::PathBuf;
+///
+/// use grobid::PdfInput;
+///
+/// // From a path on disk ...
+/// let from_path = PdfInput::from("paper.pdf");
+/// assert!(matches!(from_path, PdfInput::Path(_)));
+///
+/// // ... or from bytes already in memory, with an explicit upload name.
+/// let from_bytes = PdfInput::from(("paper.pdf", vec![0x25, 0x50, 0x44, 0x46]));
+/// assert!(matches!(from_bytes, PdfInput::Data { .. }));
+/// ```
 #[derive(Debug, Clone)]
 pub enum PdfInput {
     /// Read the PDF from the given path. The file name of the path is used
@@ -411,12 +466,56 @@ impl GrobidClient {
     /// e.g. `http://localhost:8070`, `localhost:8070` or
     /// `https://grobid.example.org/`. An optional context path is
     /// preserved.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # fn main() -> Result<(), grobid::Error> {
+    /// use grobid::GrobidClient;
+    ///
+    /// let client = GrobidClient::new("localhost:8070")?;
+    /// assert_eq!(client.base_url().as_str(), "http://localhost:8070/");
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::InvalidBaseUrl`] if the string is not a valid URL,
+    /// * [`Error::UnsupportedScheme`] if it uses a scheme other than `http`
+    ///   or `https`.
     pub fn new(base_url: impl AsRef<str>) -> Result<Self, Error> {
         Ok(Self::builder(base_url)?.build())
     }
 
     /// Create a client builder for customizing the HTTP client and retry
     /// behaviour.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # fn main() -> Result<(), grobid::Error> {
+    /// use std::time::Duration;
+    ///
+    /// use grobid::{GrobidClient, RetryPolicy};
+    ///
+    /// let client = GrobidClient::builder("http://localhost:8070")?
+    ///     .retry(RetryPolicy {
+    ///         max_attempts: 3,
+    ///         initial_delay: Duration::from_secs(1),
+    ///         ..RetryPolicy::default()
+    ///     })
+    ///     .build();
+    /// assert_eq!(client.retry_policy().max_attempts, 3);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::InvalidBaseUrl`] if the string is not a valid URL,
+    /// * [`Error::UnsupportedScheme`] if it uses a scheme other than `http`
+    ///   or `https`.
     pub fn builder(base_url: impl AsRef<str>) -> Result<GrobidClientBuilder, Error> {
         let base_url = normalize_base_url(base_url.as_ref())?;
         Ok(GrobidClientBuilder {
@@ -443,6 +542,26 @@ impl GrobidClient {
 
     /// Check that the server is alive (`GET /api/isalive`). Returns `true`
     /// when the server responds successfully.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), grobid::Error> {
+    /// let client = grobid::GrobidClient::new("http://localhost:8070")?;
+    /// if client.ping().await? {
+    ///     println!("server is ready");
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::Http`] if the server cannot be reached,
+    /// * [`Error::HttpStatus`] if it answers with an unexpected status
+    ///   code,
+    /// * [`Error::ServerBusy`] if it stays busy (HTTP 503/429) for all
+    ///   attempts of the [`RetryPolicy`].
     pub async fn ping(&self) -> Result<bool, Error> {
         let url = self.api_url("isalive");
         let http = self.http.clone();
@@ -461,6 +580,24 @@ impl GrobidClient {
     }
 
     /// The version of the running GROBID service (`GET /api/version`).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), grobid::Error> {
+    /// let client = grobid::GrobidClient::new("http://localhost:8070")?;
+    /// println!("GROBID {}", client.version().await?);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::Http`] if the server cannot be reached,
+    /// * [`Error::HttpStatus`] if it answers with an unexpected status
+    ///   code,
+    /// * [`Error::ServerBusy`] if it stays busy (HTTP 503/429) for all
+    ///   attempts of the [`RetryPolicy`].
     pub async fn version(&self) -> Result<String, Error> {
         let url = self.api_url("version");
         let http = self.http.clone();
@@ -480,6 +617,32 @@ impl GrobidClient {
 
     /// Process a full document (header, body and references) and return the
     /// parsed TEI (`/api/processFulltextDocument`).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), grobid::Error> {
+    /// use grobid::{GrobidClient, ProcessOptions};
+    ///
+    /// let client = GrobidClient::new("http://localhost:8070")?;
+    /// let document = client
+    ///     .process_fulltext_document("paper.pdf", &ProcessOptions::default())
+    ///     .await?;
+    /// println!("{:?}", document.header.title);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::Io`] if a PDF path cannot be read,
+    /// * [`Error::Http`] if the request fails at the transport level,
+    /// * [`Error::HttpStatus`] if the server answers with an error status,
+    /// * [`Error::ServerBusy`] if the server stays busy (HTTP 503/429) for
+    ///   all attempts of the [`RetryPolicy`],
+    /// * [`Error::NoContent`] if nothing could be extracted (HTTP 204),
+    /// * [`Error::Xml`] / [`Error::InvalidDocument`] if the response cannot
+    ///   be parsed as GROBID TEI.
     pub async fn process_fulltext_document(
         &self,
         pdf: impl Into<PdfInput>,
@@ -494,6 +657,28 @@ impl GrobidClient {
 
     /// Process the header of a document and return the parsed TEI
     /// (`/api/processHeaderDocument`).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), grobid::Error> {
+    /// use grobid::{GrobidClient, ProcessOptions};
+    ///
+    /// let client = GrobidClient::new("http://localhost:8070")?;
+    /// let document = client
+    ///     .process_header_document("paper.pdf", &ProcessOptions::default())
+    ///     .await?;
+    /// for author in &document.header.authors {
+    ///     println!("{:?}", author.full_name);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// See [`GrobidClient::process_fulltext_document`]; the header service
+    /// reports the same failures.
     pub async fn process_header_document(
         &self,
         pdf: impl Into<PdfInput>,
@@ -509,6 +694,28 @@ impl GrobidClient {
     /// Extract and parse all bibliographic references of a document
     /// (`/api/processReferences`). An HTTP 204 response (nothing extracted)
     /// yields an empty list.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), grobid::Error> {
+    /// use grobid::{GrobidClient, ProcessOptions};
+    ///
+    /// let client = GrobidClient::new("http://localhost:8070")?;
+    /// let references = client
+    ///     .process_references("paper.pdf", &ProcessOptions::default())
+    ///     .await?;
+    /// for reference in &references {
+    ///     println!("{:?}", reference.title);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// See [`GrobidClient::process_fulltext_document`], except that an
+    /// empty result is not an error: it yields an empty vector.
     pub async fn process_references(
         &self,
         pdf: impl Into<PdfInput>,
@@ -526,6 +733,33 @@ impl GrobidClient {
     /// Parse a single raw bibliographic reference string
     /// (`/api/processCitation`). Returns `None` when GROBID could not
     /// extract any usable citation.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), grobid::Error> {
+    /// use grobid::{GrobidClient, ProcessOptions};
+    ///
+    /// let client = GrobidClient::new("http://localhost:8070")?;
+    /// let citation = client
+    ///     .process_citation(
+    ///         "Graff, Expert. Opin. Ther. Targets (2002) 6(1): 103-113",
+    ///         &ProcessOptions::default(),
+    ///     )
+    ///     .await?;
+    /// if let Some(citation) = citation {
+    ///     println!("{:?}", citation.journal);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::Http`] / [`Error::HttpStatus`] / [`Error::ServerBusy`]
+    ///   for transport, status and capacity failures,
+    /// * [`Error::Xml`] / [`Error::InvalidCoords`] if the response cannot be
+    ///   parsed.
     pub async fn process_citation(
         &self,
         citation: &str,
@@ -541,6 +775,28 @@ impl GrobidClient {
 
     /// Parse a list of raw bibliographic reference strings
     /// (`/api/processCitationList`).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), grobid::Error> {
+    /// use grobid::{GrobidClient, ProcessOptions};
+    ///
+    /// let client = GrobidClient::new("http://localhost:8070")?;
+    /// let references = client
+    ///     .process_citation_list(
+    ///         ["Graff, Expert. Opin. Ther. Targets (2002) 6(1): 103-113"],
+    ///         &ProcessOptions::default(),
+    ///     )
+    ///     .await?;
+    /// assert_eq!(references.len(), 1);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// See [`GrobidClient::process_citation`].
     pub async fn process_citation_list(
         &self,
         citations: impl IntoIterator<Item = impl AsRef<str>>,
@@ -561,7 +817,32 @@ impl GrobidClient {
     /// return the raw response body. Use this for services without a typed
     /// wrapper, e.g. the patent processing services.
     ///
-    /// HTTP 204 responses yield [`Error::NoContent`].
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), grobid::Error> {
+    /// use grobid::{GrobidClient, ProcessOptions};
+    ///
+    /// let client = GrobidClient::new("http://localhost:8070")?;
+    /// let tei = client
+    ///     .process_pdf_raw(
+    ///         "processCitationPatentST36",
+    ///         "patent.xml",
+    ///         &ProcessOptions::default(),
+    ///     )
+    ///     .await?;
+    /// println!("{tei}");
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::Io`] if a PDF path cannot be read,
+    /// * [`Error::Http`] / [`Error::HttpStatus`] / [`Error::ServerBusy`]
+    ///   for transport, status and capacity failures,
+    /// * [`Error::NoContent`] if the server reports an empty result
+    ///   (HTTP 204).
     pub async fn process_pdf_raw(
         &self,
         service: &str,

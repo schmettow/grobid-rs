@@ -67,9 +67,14 @@
 //! assert_eq!(document.header.title.as_deref(), Some("Example"));
 //! # Ok::<(), grobid::Error>(())
 //! ```
-
+//!
+//! The full README is included below.
+//!
+#![doc = include_str!("../README.md")]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+#![warn(clippy::missing_errors_doc)]
+#![warn(clippy::missing_panics_doc)]
 
 pub mod bibtex;
 mod client;

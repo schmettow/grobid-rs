@@ -20,6 +20,39 @@ use crate::Error;
 
 /// Parse a full GROBID TEI document, as returned by e.g.
 /// `processFulltextDocument` or `processHeaderDocument`.
+///
+/// # Example
+///
+/// ```
+/// use grobid::tei::parse_document;
+///
+/// let xml = r#"<TEI xmlns="http://www.tei-c.org/ns/1.0">
+///   <teiHeader><encodingDesc><appInfo>
+///     <application version="0.9" when="2024-01-01T00:00+0000"/>
+///   </appInfo></encodingDesc>
+///   <fileDesc><titleStmt><title level="a" type="main">Example</title></titleStmt>
+///     <publicationStmt><publisher/></publicationStmt>
+///     <sourceDesc><biblStruct/></sourceDesc></fileDesc></teiHeader>
+///   <text xml:lang="en"><body>
+///     <div><head>Introduction</head><p>Hello world.</p></div>
+///   </body></text>
+/// </TEI>"#;
+///
+/// let document = parse_document(xml)?;
+/// assert_eq!(document.header.title.as_deref(), Some("Example"));
+/// assert_eq!(document.language.as_deref(), Some("en"));
+/// assert_eq!(document.body[0].head.as_deref(), Some("Introduction"));
+/// # Ok::<(), grobid::Error>(())
+/// ```
+///
+/// # Errors
+///
+/// * [`Error::Xml`] if the input is not well-formed XML,
+/// * [`Error::InvalidDocument`] if the XML is not a GROBID TEI document,
+///   e.g. because the root element is not `<TEI>`, or the `<teiHeader>` is
+///   missing the `<appInfo><application>` element,
+/// * [`Error::InvalidCoords`] if the document contains a malformed
+///   `@coords` attribute.
 pub fn parse_document(xml: &str) -> Result<Document, Error> {
     let doc = roxmltree::Document::parse(xml)?;
     let root = doc.root_element();
@@ -96,6 +129,30 @@ pub fn parse_document(xml: &str) -> Result<Document, Error> {
 /// Parse a list of references, as returned by `/api/processCitationList` or
 /// `/api/processReferences`. Handles both bare `<biblStruct>` responses and
 /// full TEI documents.
+///
+/// # Example
+///
+/// ```
+/// use grobid::tei::parse_citation_list;
+///
+/// let xml = r#"<biblStruct>
+///   <analytic><title level="a" type="main">A paper</title></analytic>
+///   <monogr><title level="j">A journal</title>
+///     <imprint><date type="published" when="2019"/></imprint></monogr>
+/// </biblStruct>"#;
+///
+/// let citations = parse_citation_list(xml)?;
+/// assert_eq!(citations.len(), 1);
+/// assert_eq!(citations[0].journal.as_deref(), Some("A journal"));
+/// assert_eq!(citations[0].date.as_deref(), Some("2019"));
+/// # Ok::<(), grobid::Error>(())
+/// ```
+///
+/// # Errors
+///
+/// * [`Error::Xml`] if the input is not well-formed XML,
+/// * [`Error::InvalidCoords`] if a reference contains a malformed `@coords`
+///   attribute.
 pub fn parse_citation_list(xml: &str) -> Result<Vec<Citation>, Error> {
     let doc = roxmltree::Document::parse(xml)?;
     let root = doc.root_element();
@@ -111,6 +168,32 @@ pub fn parse_citation_list(xml: &str) -> Result<Vec<Citation>, Error> {
 
 /// Parse a single reference, as returned by `/api/processCitation`. Returns
 /// `None` when the response contains no usable citation.
+///
+/// # Example
+///
+/// ```
+/// use grobid::tei::parse_citation;
+///
+/// let xml = r#"<biblStruct>
+///   <analytic><title level="a" type="main">A paper</title></analytic>
+///   <monogr><title level="j">A journal</title>
+///     <imprint><date type="published" when="2019"/></imprint></monogr>
+/// </biblStruct>"#;
+///
+/// let citation = parse_citation(xml)?.expect("a usable citation");
+/// assert_eq!(citation.title.as_deref(), Some("A paper"));
+///
+/// // An empty parse result yields `None` rather than an empty citation.
+/// let empty = r#"<biblStruct><monogr><title/></monogr></biblStruct>"#;
+/// assert!(parse_citation(empty)?.is_none());
+/// # Ok::<(), grobid::Error>(())
+/// ```
+///
+/// # Errors
+///
+/// * [`Error::Xml`] if the input is not well-formed XML,
+/// * [`Error::InvalidCoords`] if the reference contains a malformed
+///   `@coords` attribute.
 pub fn parse_citation(xml: &str) -> Result<Option<Citation>, Error> {
     let mut list = parse_citation_list(xml)?;
     let citation = list.drain(..).next();

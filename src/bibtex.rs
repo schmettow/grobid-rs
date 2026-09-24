@@ -23,6 +23,22 @@ use crate::tei::{Author, Biblio};
 /// * [`EntryType::TechReport`] for records with an issuing institution,
 /// * [`EntryType::Book`] for records with a publisher,
 /// * [`EntryType::Misc`] otherwise.
+///
+/// ```
+/// use grobid::{bibtex, Biblio};
+///
+/// let biblio = Biblio {
+///     journal: Some("Nature".to_string()),
+///     ..Biblio::default()
+/// };
+/// assert_eq!(bibtex::entry_type(&biblio), biblatex::EntryType::Article);
+///
+/// let biblio = Biblio {
+///     title: Some("A dataset".to_string()),
+///     ..Biblio::default()
+/// };
+/// assert_eq!(bibtex::entry_type(&biblio), biblatex::EntryType::Misc);
+/// ```
 pub fn entry_type(biblio: &Biblio) -> EntryType {
     if biblio.journal.is_some() {
         EntryType::Article
@@ -40,6 +56,17 @@ pub fn entry_type(biblio: &Biblio) -> EntryType {
 }
 
 /// Extract the publication year (first four digits) from the date.
+///
+/// ```
+/// use grobid::{bibtex, Biblio};
+///
+/// let biblio = Biblio {
+///     date: Some("2019-01-30".to_string()),
+///     ..Biblio::default()
+/// };
+/// assert_eq!(bibtex::year(&biblio).as_deref(), Some("2019"));
+/// assert_eq!(bibtex::year(&Biblio::default()), None);
+/// ```
 pub fn year(biblio: &Biblio) -> Option<String> {
     let date = biblio.date.as_deref()?;
     let digits: String = date
@@ -59,6 +86,21 @@ pub fn year(biblio: &Biblio) -> Option<String> {
 /// key is filtered to ASCII alphanumerics.
 ///
 /// Use [`unique_key`] when the suggested key must be collision-free.
+///
+/// ```
+/// use grobid::{bibtex, Author, Biblio};
+///
+/// let biblio = Biblio {
+///     authors: vec![Author {
+///         surname: Some("Milašauskienė".to_string()),
+///         ..Author::default()
+///     }],
+///     date: Some("2003".to_string()),
+///     ..Biblio::default()
+/// };
+/// assert_eq!(bibtex::suggest_key(&biblio), "Milaauskien2003");
+/// assert_eq!(bibtex::suggest_key(&Biblio::default()), "ref");
+/// ```
 pub fn suggest_key(biblio: &Biblio) -> String {
     let surname = biblio
         .authors
@@ -80,6 +122,26 @@ pub fn suggest_key(biblio: &Biblio) -> String {
 ///
 /// For deterministic output, feed the records in a stable order (e.g.
 /// sorted by [`suggest_key`]).
+///
+/// ```
+/// use std::collections::HashSet;
+///
+/// use grobid::{bibtex, Author, Biblio};
+///
+/// let make = |surname: &str| Biblio {
+///     authors: vec![Author {
+///         surname: Some(surname.to_string()),
+///         ..Author::default()
+///     }],
+///     date: Some("2020".to_string()),
+///     ..Biblio::default()
+/// };
+///
+/// let mut used = HashSet::new();
+/// assert_eq!(bibtex::unique_key(&make("Smith"), &mut used), "Smith2020");
+/// assert_eq!(bibtex::unique_key(&make("Smith"), &mut used), "Smith2020-2");
+/// assert_eq!(bibtex::unique_key(&make("Jones"), &mut used), "Jones2020");
+/// ```
 pub fn unique_key(biblio: &Biblio, used: &mut HashSet<String>) -> String {
     let base = suggest_key(biblio);
     if used.insert(base.clone()) {
@@ -102,6 +164,30 @@ pub fn unique_key(biblio: &Biblio, used: &mut HashSet<String>) -> String {
 /// fields become plain text values. The returned entry can be serialized
 /// with [`Entry::to_bibtex_string`], inspected with the typed getters, or
 /// inserted into a [`biblatex::Bibliography`].
+///
+/// ```
+/// use grobid::{bibtex, Author, Biblio};
+///
+/// let biblio = Biblio {
+///     authors: vec![Author {
+///         given_name: Some("Brewster".to_string()),
+///         surname: Some("Kahle".to_string()),
+///         ..Author::default()
+///     }],
+///     title: Some("Dummy Example File".to_string()),
+///     date: Some("2000-03-01".to_string()),
+///     ..Biblio::default()
+/// };
+///
+/// let entry = bibtex::to_entry("kahle2000", &biblio);
+///
+/// // The entry is typed, not just text: fields can be read back through
+/// // the biblatex getters.
+/// let authors = entry.get_as::<Vec<biblatex::Person>>("author").unwrap();
+/// assert_eq!(authors[0].name, "Kahle");
+/// assert_eq!(authors[0].given_name, "Brewster");
+/// println!("{}", entry.to_bibtex_string().unwrap());
+/// ```
 pub fn to_entry(key: &str, biblio: &Biblio) -> Entry {
     let mut entry = Entry::new(key.to_string(), entry_type(biblio));
 
@@ -138,10 +224,34 @@ pub fn to_entry(key: &str, biblio: &Biblio) -> Entry {
 
 /// Render one record as a BibTeX entry.
 ///
-/// This never fails: entries are built from typed values in [`to_entry`],
-/// and because the writer handles unparseable dates permissively (emitting
-/// them as a literal `date = {...}` field), the serializer cannot error on
-/// entries produced here.
+/// ```
+/// use grobid::{bibtex, Author, Biblio};
+///
+/// let biblio = Biblio {
+///     authors: vec![Author {
+///         given_name: Some("Brewster".to_string()),
+///         surname: Some("Kahle".to_string()),
+///         ..Author::default()
+///     }],
+///     title: Some("Dummy Example File".to_string()),
+///     journal: Some("Journal of Fake News".to_string()),
+///     date: Some("2000".to_string()),
+///     ..Biblio::default()
+/// };
+///
+/// let entry = bibtex::format_entry("kahle2000", &biblio);
+/// assert!(entry.starts_with("@article{kahle2000,\n"));
+/// assert!(entry.contains("author = {Kahle, Brewster},"));
+/// assert!(entry.contains("journal = {Journal of Fake News},"));
+/// ```
+///
+/// # Panics
+///
+/// This function does not panic for any input: entries built from typed
+/// values in [`to_entry`] always serialize, and unparseable dates are
+/// emitted as a literal `date = {...}` field rather than causing an error.
+/// The internal assertion on that invariant exists so that a future
+/// regression surfaces as a panic instead of a silently truncated entry.
 pub fn format_entry(key: &str, biblio: &Biblio) -> String {
     match to_entry(key, biblio).to_bibtex_string() {
         Ok(entry) => entry,

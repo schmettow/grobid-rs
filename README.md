@@ -25,8 +25,8 @@ modelled after the `grobid-tei-xml` Python package.
 ```rust
 use grobid::{GrobidClient, ProcessOptions};
 
-#[tokio::main]
-async fn main() -> Result<(), grobid::Error> {
+// Inside a `#[tokio::main]` function:
+async fn example() -> Result<(), grobid::Error> {
     let client = GrobidClient::new("http://localhost:8070")?;
     assert!(client.ping().await?);
 
@@ -52,15 +52,19 @@ PDFs can also be passed as bytes, avoiding a round-trip through the
 filesystem:
 
 ```rust
-use grobid::PdfInput;
+use grobid::{GrobidClient, PdfInput, ProcessOptions};
 
-let pdf = PdfInput::Data {
-    filename: "paper.pdf".to_string(),
-    data: downloaded_bytes,
-};
-let document = client
-    .process_fulltext_document(pdf, &ProcessOptions::default())
-    .await?;
+async fn example(downloaded_bytes: Vec<u8>) -> Result<(), grobid::Error> {
+    let client = GrobidClient::new("http://localhost:8070")?;
+    let pdf = PdfInput::Data {
+        filename: "paper.pdf".to_string(),
+        data: downloaded_bytes,
+    };
+    let document = client
+        .process_fulltext_document(pdf, &ProcessOptions::default())
+        .await?;
+    Ok(())
+}
 ```
 
 ### Services
@@ -83,21 +87,25 @@ GROBID server defaults and the official Python client (header consolidation
 on, citation consolidation off):
 
 ```rust
-use grobid::{CoordinateElement, HeaderConsolidation, ProcessOptions};
+use grobid::{CoordinateElement, GrobidClient, ProcessOptions};
 
-let options = ProcessOptions {
-    generate_ids: true,
-    include_raw_citations: true,
-    tei_coordinates: CoordinateElement::COMMON.to_vec(),
-    segment_sentences: true,
-    ..Default::default()
-};
-let document = client
-    .process_fulltext_document("paper.pdf", &options)
-    .await?;
-// Coordinates of figures, references, ... in the original PDF:
-for figure in document.body[0].figures() {
-    println!("{:?} at {:?}", figure.head, figure.coords);
+async fn example() -> Result<(), grobid::Error> {
+    let client = GrobidClient::new("http://localhost:8070")?;
+    let options = ProcessOptions {
+        generate_ids: true,
+        include_raw_citations: true,
+        tei_coordinates: CoordinateElement::COMMON.to_vec(),
+        segment_sentences: true,
+        ..Default::default()
+    };
+    let document = client
+        .process_fulltext_document("paper.pdf", &options)
+        .await?;
+    // Coordinates of figures, references, ... in the original PDF:
+    for figure in document.body[0].figures() {
+        println!("{:?} at {:?}", figure.head, figure.coords);
+    }
+    Ok(())
 }
 ```
 
@@ -109,8 +117,12 @@ batch process:
 ```rust
 use grobid::tei::parse_document;
 
-let xml = std::fs::read_to_string("output.tei.xml")?;
-let document = parse_document(&xml)?;
+fn example() -> Result<(), Box<dyn std::error::Error>> {
+    let xml = std::fs::read_to_string("output.tei.xml")?;
+    let document = parse_document(&xml)?;
+    println!("{:?}", document.header.title);
+    Ok(())
+}
 ```
 
 The parser is namespace-agnostic: it accepts both full TEI documents in the
@@ -123,7 +135,12 @@ All parsed types implement `serde::Serialize`/`Deserialize`, so a document
 can be converted to JSON (or any other `serde` format) with e.g. `serde_json`:
 
 ```rust
-let json = serde_json::to_string_pretty(&document)?;
+fn example(xml: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let document = grobid::tei::parse_document(xml)?;
+    let json = serde_json::to_string_pretty(&document)?;
+    println!("{json}");
+    Ok(())
+}
 ```
 
 ## Coordinates
@@ -185,4 +202,4 @@ example with `--help` for all options.
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT, see [LICENSE](https://github.com/schmettow/grobid-rs/blob/main/LICENSE).

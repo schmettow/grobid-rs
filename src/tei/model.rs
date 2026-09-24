@@ -45,9 +45,24 @@ impl Coords {
     /// The compact notation consists of bounding boxes separated by `;`,
     /// each box being `page,x,y,width,height`:
     ///
-    /// ```text
-    /// "1,53.80,194.57,58.71,9.29;1,53.80,202.57,58.71,9.29"
     /// ```
+    /// use grobid::Coords;
+    ///
+    /// let coords = Coords::parse("1,53.80,194.57,58.71,9.29")?;
+    /// assert_eq!(coords.boxes.len(), 1);
+    /// assert_eq!(coords.boxes[0].page, 1);
+    /// assert_eq!(coords.boxes[0].x, 53.80);
+    ///
+    /// // A structure can span several boxes, e.g. across multiple lines.
+    /// let coords = Coords::parse("10,317.03,183.61,223.16,7.55;10,317.03,192.57,223.21,7.55")?;
+    /// assert_eq!(coords.boxes.len(), 2);
+    /// # Ok::<(), grobid::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::InvalidCoords`] when a box does not consist of
+    /// exactly five comma-separated numbers.
     pub fn parse(value: &str) -> Result<Self, crate::Error> {
         let mut boxes = Vec::new();
         for part in value.split(';') {
@@ -128,6 +143,19 @@ pub struct Author {
 
 impl Author {
     /// Returns true if nothing is known about this author.
+    ///
+    /// ```
+    /// use grobid::Author;
+    ///
+    /// assert!(Author::default().is_empty());
+    ///
+    /// let author = Author {
+    ///     given_name: Some("Brewster".to_string()),
+    ///     surname: Some("Kahle".to_string()),
+    ///     ..Author::default()
+    /// };
+    /// assert!(!author.is_empty());
+    /// ```
     pub fn is_empty(&self) -> bool {
         self.full_name.is_none()
             && self.given_name.is_none()
@@ -295,6 +323,27 @@ impl Biblio {
     /// empty when it has neither authors nor editors and none of the main
     /// bibliographic fields are set. Note that a `raw_reference` alone does
     /// not make a record non-empty.
+    ///
+    /// ```
+    /// use grobid::Biblio;
+    ///
+    /// assert!(Biblio::default().is_empty());
+    ///
+    /// // A single identifier, e.g. from an unparsed reference, is enough
+    /// // to make the record non-empty.
+    /// let biblio = Biblio {
+    ///     doi: Some("10.1234/example".to_string()),
+    ///     ..Biblio::default()
+    /// };
+    /// assert!(!biblio.is_empty());
+    ///
+    /// // A raw reference string alone does not.
+    /// let biblio = Biblio {
+    ///     raw_reference: Some("Smith 2001".to_string()),
+    ///     ..Biblio::default()
+    /// };
+    /// assert!(biblio.is_empty());
+    /// ```
     pub fn is_empty(&self) -> bool {
         if !self.authors.is_empty() || !self.editors.is_empty() {
             return false;
@@ -581,6 +630,34 @@ pub struct Div {
 impl Div {
     /// All paragraphs of this section, including paragraphs of nested
     /// subsections, in document order.
+    ///
+    /// ```
+    /// use grobid::tei::parse_document;
+    ///
+    /// let xml = r#"<TEI xmlns="http://www.tei-c.org/ns/1.0">
+    ///   <teiHeader><encodingDesc><appInfo>
+    ///     <application version="0.9" when="2024-01-01T00:00+0000"/>
+    ///   </appInfo></encodingDesc>
+    ///   <fileDesc><titleStmt><title level="a" type="main">Example</title></titleStmt>
+    ///     <publicationStmt><publisher/></publicationStmt>
+    ///     <sourceDesc><biblStruct/></sourceDesc></fileDesc></teiHeader>
+    ///   <text><body><div>
+    ///     <head>Results</head>
+    ///     <p>First paragraph.</p>
+    ///     <div><head>Subsection</head><p>Nested paragraph.</p></div>
+    ///   </div></body></text>
+    /// </TEI>"#;
+    ///
+    /// let document = parse_document(xml)?;
+    /// let section = &document.body[0];
+    /// let paragraphs: Vec<&str> = section
+    ///     .paragraphs()
+    ///     .iter()
+    ///     .map(|p| p.text.as_str())
+    ///     .collect();
+    /// assert_eq!(paragraphs, ["First paragraph.", "Nested paragraph."]);
+    /// # Ok::<(), grobid::Error>(())
+    /// ```
     pub fn paragraphs(&self) -> Vec<&Paragraph> {
         fn collect<'a>(div: &'a Div, out: &mut Vec<&'a Paragraph>) {
             for block in &div.blocks {
@@ -598,6 +675,32 @@ impl Div {
 
     /// All figures and tables of this section, including nested
     /// subsections, in document order.
+    ///
+    /// ```
+    /// use grobid::tei::parse_document;
+    ///
+    /// let xml = r#"<TEI xmlns="http://www.tei-c.org/ns/1.0">
+    ///   <teiHeader><encodingDesc><appInfo>
+    ///     <application version="0.9" when="2024-01-01T00:00+0000"/>
+    ///   </appInfo></encodingDesc>
+    ///   <fileDesc><titleStmt><title level="a" type="main">Example</title></titleStmt>
+    ///     <publicationStmt><publisher/></publicationStmt>
+    ///     <sourceDesc><biblStruct/></sourceDesc></fileDesc></teiHeader>
+    ///   <text><body><div>
+    ///     <head>Results</head>
+    ///     <figure xml:id="fig_1"><head>Fig. 1</head><figDesc>A caption</figDesc></figure>
+    ///     <figure type="table" xml:id="tab_1"><head>Table 1</head></figure>
+    ///   </div></body></text>
+    /// </TEI>"#;
+    ///
+    /// let document = parse_document(xml)?;
+    /// let figures = document.body[0].figures();
+    /// assert_eq!(figures.len(), 2);
+    /// assert_eq!(figures[0].caption.as_deref(), Some("A caption"));
+    /// // GROBID encodes tables as figures with type="table".
+    /// assert_eq!(figures[1].figure_type.as_deref(), Some("table"));
+    /// # Ok::<(), grobid::Error>(())
+    /// ```
     pub fn figures(&self) -> Vec<&Figure> {
         fn collect<'a>(div: &'a Div, out: &mut Vec<&'a Figure>) {
             for block in &div.blocks {
@@ -671,6 +774,26 @@ impl Document {
     /// The full body text as a single string: the text of all body
     /// elements (headings, paragraphs, markers, captions, footnotes) joined
     /// with single spaces.
+    ///
+    /// ```
+    /// use grobid::tei::parse_document;
+    ///
+    /// let xml = r##"<TEI xmlns="http://www.tei-c.org/ns/1.0">
+    ///   <teiHeader><encodingDesc><appInfo>
+    ///     <application version="0.9" when="2024-01-01T00:00+0000"/>
+    ///   </appInfo></encodingDesc>
+    ///   <fileDesc><titleStmt><title level="a" type="main">Example</title></titleStmt>
+    ///     <publicationStmt><publisher/></publicationStmt>
+    ///     <sourceDesc><biblStruct/></sourceDesc></fileDesc></teiHeader>
+    ///   <text><body>
+    ///     <div><head>Introduction</head><p>Hello <ref type="bibr" target="#b0">[1]</ref>.</p></div>
+    ///   </body></text>
+    /// </TEI>"##;
+    ///
+    /// let document = parse_document(xml)?;
+    /// assert_eq!(document.body_text(), "Introduction Hello [1] .");
+    /// # Ok::<(), grobid::Error>(())
+    /// ```
     pub fn body_text(&self) -> String {
         let mut parts = Vec::new();
         for div in &self.body {
@@ -684,6 +807,30 @@ impl Document {
 
     /// Look up a citation by its `xml:id` (e.g. `b12`, or `#b12` with the
     /// leading `#` of an in-text reference target).
+    ///
+    /// ```
+    /// use grobid::tei::parse_document;
+    ///
+    /// let xml = r#"<TEI xmlns="http://www.tei-c.org/ns/1.0">
+    ///   <teiHeader><encodingDesc><appInfo>
+    ///     <application version="0.9" when="2024-01-01T00:00+0000"/>
+    ///   </appInfo></encodingDesc>
+    ///   <fileDesc><titleStmt><title level="a" type="main">Example</title></titleStmt>
+    ///     <publicationStmt><publisher/></publicationStmt>
+    ///     <sourceDesc><biblStruct/></sourceDesc></fileDesc></teiHeader>
+    ///   <text><back><div type="references"><listBibl>
+    ///     <biblStruct xml:id="b0">
+    ///       <monogr><title level="j">A journal</title></monogr>
+    ///     </biblStruct>
+    ///   </listBibl></div></back></text>
+    /// </TEI>"#;
+    ///
+    /// let document = parse_document(xml)?;
+    /// let citation = document.find_citation("#b0").expect("citation b0");
+    /// assert_eq!(citation.journal.as_deref(), Some("A journal"));
+    /// assert!(document.find_citation("b1").is_none());
+    /// # Ok::<(), grobid::Error>(())
+    /// ```
     pub fn find_citation(&self, id: &str) -> Option<&Citation> {
         let id = id.strip_prefix('#').unwrap_or(id);
         self.citations.iter().find(|c| c.id.as_deref() == Some(id))
