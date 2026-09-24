@@ -4,7 +4,7 @@
 //! modelled after.
 
 use grobid::tei::{parse_citation, parse_citation_list, parse_document};
-use grobid::{Block, Coords, Error, RefKind, Surface};
+use grobid::{Block, Coords, Error, InvalidDocument, RefKind, Surface};
 
 const EXAMPLE_TEI: &str = include_str!("../testdata/document/example.tei.xml");
 const SMALL_TEI: &str = include_str!("../testdata/small.xml");
@@ -352,12 +352,18 @@ fn test_invalid_document() {
     ));
     assert!(matches!(
         parse_document("<xml></xml>"),
-        Err(Error::InvalidDocument(_))
+        Err(Error::InvalidDocument(InvalidDocument::NotTei))
     ));
     // A TEI root without a teiHeader is rejected as well.
     assert!(matches!(
         parse_document("<TEI><text><body/></text></TEI>"),
-        Err(Error::InvalidDocument(_))
+        Err(Error::InvalidDocument(InvalidDocument::MissingTeiHeader))
+    ));
+    // A teiHeader without appInfo/application is rejected, since it does
+    // not carry the GROBID version.
+    assert!(matches!(
+        parse_document("<TEI><teiHeader><fileDesc/></teiHeader><text/></TEI>"),
+        Err(Error::InvalidDocument(InvalidDocument::MissingApplication))
     ));
 }
 
@@ -426,6 +432,9 @@ const COORDINATED_TEI: &str = r##"
         <div>
           <head n="1.1">Sub</head>
           <p>Nested paragraph.</p>
+          <figure xml:id="fig_2">
+            <label>2</label><figDesc>Nested caption</figDesc>
+          </figure>
         </div>
       </div>
     </body>
@@ -520,6 +529,16 @@ fn test_coordinated_document() {
     assert_eq!(subsection.paragraphs()[0].text, "Nested paragraph.");
     assert_eq!(section.subsections().count(), 1);
     assert_eq!(section.paragraphs().len(), 2);
+
+    // Figures are collected recursively, across nested subsections.
+    assert_eq!(section.figures().len(), 2);
+    assert_eq!(section.figures()[0].id.as_deref(), Some("fig_1"));
+    assert_eq!(section.figures()[1].id.as_deref(), Some("fig_2"));
+    assert_eq!(
+        section.figures()[1].caption.as_deref(),
+        Some("Nested caption")
+    );
+    assert_eq!(subsection.figures().len(), 1);
 
     // Citation with two coordinate boxes.
     assert_eq!(doc.citations.len(), 1);

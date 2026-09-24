@@ -446,12 +446,17 @@ impl GrobidClient {
     pub async fn ping(&self) -> Result<bool, Error> {
         let url = self.api_url("isalive");
         let http = self.http.clone();
+        let request_url = url.clone();
         let response = self.request(move || http.get(url.clone())).await?;
         let status = response.status();
         let body = response.text().await?;
         match status {
             StatusCode::OK => Ok(body.trim() == "true"),
-            status => Err(Error::http_status(status.as_u16(), "isalive", body)),
+            status => Err(Error::http_status(
+                status.as_u16(),
+                request_url.to_string(),
+                body,
+            )),
         }
     }
 
@@ -459,12 +464,17 @@ impl GrobidClient {
     pub async fn version(&self) -> Result<String, Error> {
         let url = self.api_url("version");
         let http = self.http.clone();
+        let request_url = url.clone();
         let response = self.request(move || http.get(url.clone())).await?;
         let status = response.status();
         let body = response.text().await?;
         match status {
             StatusCode::OK => Ok(body.trim().to_string()),
-            status => Err(Error::http_status(status.as_u16(), "version", body)),
+            status => Err(Error::http_status(
+                status.as_u16(),
+                request_url.to_string(),
+                body,
+            )),
         }
     }
 
@@ -576,7 +586,8 @@ impl GrobidClient {
         let url = self.api_url(service);
         let http = self.http.clone();
         let options = options.clone();
-        self.send_for_text(service, move || {
+        let request_url = url.clone();
+        self.send_for_text(request_url, move || {
             let part = Part::bytes(data.clone())
                 .file_name(filename.clone())
                 .mime_str("application/pdf")
@@ -596,7 +607,8 @@ impl GrobidClient {
     ) -> Result<Option<String>, Error> {
         let url = self.api_url(service);
         let http = self.http.clone();
-        self.send_for_text(service, move || http.post(url.clone()).form(&fields))
+        let request_url = url.clone();
+        self.send_for_text(request_url, move || http.post(url.clone()).form(&fields))
             .await
     }
 
@@ -604,7 +616,7 @@ impl GrobidClient {
     /// body and translate the status code. The builder closure is invoked
     /// anew for every retry attempt, so request bodies are always
     /// re-encodable.
-    async fn send_for_text<F>(&self, service: &str, build: F) -> Result<Option<String>, Error>
+    async fn send_for_text<F>(&self, url: Url, build: F) -> Result<Option<String>, Error>
     where
         F: Fn() -> RequestBuilder,
     {
@@ -619,7 +631,7 @@ impl GrobidClient {
                     attempts: self.retry.max_attempts,
                 })
             }
-            status => Err(Error::http_status(status.as_u16(), service, body)),
+            status => Err(Error::http_status(status.as_u16(), url.to_string(), body)),
         }
     }
 
@@ -647,14 +659,17 @@ impl GrobidClient {
 
     /// Build the URL of a service under the `/api/` path.
     fn api_url(&self, service: &str) -> Url {
+        // Cannot fail: the constructor only accepts hierarchical http(s)
+        // URLs as the base, which always support relative paths.
         self.base_url
             .join(&format!("api/{service}"))
             .expect("base URL always supports relative paths")
     }
 }
 
-/// Normalize a user-supplied base URL: add a scheme when missing and ensure
-/// the path ends with a slash so that relative paths can be joined.
+/// Normalize a user-supplied base URL: add a scheme when missing, require
+/// `http`/`https`, and ensure the path ends with a slash so that relative
+/// paths can be joined.
 fn normalize_base_url(base_url: &str) -> Result<Url, Error> {
     let trimmed = base_url.trim().trim_end_matches('/');
     let with_scheme = if trimmed.contains("://") {
@@ -666,6 +681,12 @@ fn normalize_base_url(base_url: &str) -> Result<Url, Error> {
         base_url: base_url.to_string(),
         source,
     })?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(Error::UnsupportedScheme {
+            base_url: base_url.to_string(),
+            scheme: url.scheme().to_string(),
+        });
+    }
     if !url.path().ends_with('/') {
         let path = format!("{}/", url.path());
         url.set_path(&path);

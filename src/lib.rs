@@ -81,7 +81,7 @@ pub use client::{
     HeaderConsolidation, PdfInput, ProcessOptions, RetryPolicy, DEFAULT_GROBID_URL,
     SERVICE_CITATION, SERVICE_CITATION_LIST, SERVICE_FULLTEXT, SERVICE_HEADER, SERVICE_REFERENCES,
 };
-pub use error::Error;
+pub use error::{Error, InvalidDocument};
 pub use tei::{
     parse_citation, parse_citation_list, parse_document, Address, Affiliation, Author, Biblio,
     Block, BoundingBox, Citation, Coords, Div, Document, Figure, Formula, Header, List, MarkerRef,

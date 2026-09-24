@@ -3,7 +3,7 @@
 A native Rust client for the [GROBID](https://grobid.readthedocs.io/) REST API,
 with a strongly typed parser for GROBID TEI documents.
 
-GROBID is a machine learning library for extracting, parsing and re-structuring
+GROBID is a machine learning system for extracting, parsing and re-structuring
 raw documents such as PDFs into structured TEI-XML. This crate provides:
 
 - an **asynchronous HTTP client** (`GrobidClient`, built on `reqwest`) for the
@@ -17,7 +17,7 @@ raw documents such as PDFs into structured TEI-XML. This crate provides:
 The client behaviour follows the official
 [Python client](https://github.com/grobidOrg/grobid-client-python); the TEI
 parser is modelled after the
-[Go client](https://github.com/schmettow/grobidclient), which is itself
+[Go client](https://github.com/miku/grobidclient), which is itself
 modelled after the `grobid-tei-xml` Python package.
 
 ## Usage

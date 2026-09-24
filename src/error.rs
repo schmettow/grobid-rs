@@ -2,6 +2,7 @@
 
 /// Errors produced by the grobid client and TEI parser.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The given base URL is not a valid URL.
     #[error("invalid base URL {base_url:?}: {source}")]
@@ -11,6 +12,19 @@ pub enum Error {
         /// The underlying URL parse error.
         #[source]
         source: url::ParseError,
+    },
+
+    /// The given base URL is valid, but uses a scheme other than `http` or
+    /// `https`.
+    #[error(
+        "unsupported URL scheme {scheme:?} in {base_url:?}: \
+         GROBID servers are reached over http or https"
+    )]
+    UnsupportedScheme {
+        /// The base URL as given by the caller.
+        base_url: String,
+        /// The unsupported scheme.
+        scheme: String,
     },
 
     /// An I/O error occurred, e.g. while reading a PDF from disk.
@@ -26,7 +40,7 @@ pub enum Error {
     HttpStatus {
         /// HTTP status code.
         status: u16,
-        /// The service URL that was requested.
+        /// The full URL that was requested.
         url: String,
         /// The response body, truncated to a reasonable length.
         message: String,
@@ -51,7 +65,7 @@ pub enum Error {
 
     /// The XML is well-formed, but does not look like a GROBID TEI document.
     #[error("invalid TEI document: {0}")]
-    InvalidDocument(&'static str),
+    InvalidDocument(#[from] InvalidDocument),
 
     /// A malformed `@coords` attribute value was encountered.
     #[error(
@@ -62,10 +76,23 @@ pub enum Error {
         /// The malformed value.
         value: String,
     },
+}
 
-    /// An internal client error.
-    #[error("{0}")]
-    Internal(&'static str),
+/// Reasons why a well-formed XML document is not a usable GROBID TEI
+/// document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum InvalidDocument {
+    /// The root element is not `<TEI>`.
+    #[error("root element is not <TEI>")]
+    NotTei,
+    /// The document has no `<teiHeader>`.
+    #[error("missing <teiHeader>")]
+    MissingTeiHeader,
+    /// The header has no `<appInfo><application>` element, which identifies
+    /// the GROBID version that produced the document.
+    #[error("missing <appInfo><application>")]
+    MissingApplication,
 }
 
 impl Error {

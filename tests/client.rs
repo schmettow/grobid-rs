@@ -316,6 +316,152 @@ async fn test_server_busy_exhausted() {
 }
 
 #[tokio::test]
+async fn test_header_document() {
+    let tei = std::fs::read_to_string("testdata/small.xml").expect("fixture");
+    let (addr, results) = spawn_mock(move |req| {
+        if req.method != "POST" {
+            return Err(format!("method: {}", req.method));
+        }
+        if req.target != "/api/processHeaderDocument" {
+            return Err(format!("target: {}", req.target));
+        }
+        let content_type = req
+            .header("content-type")
+            .ok_or("missing content-type")?
+            .to_string();
+        if !content_type.starts_with("multipart/form-data; boundary=") {
+            return Err(format!("content-type: {content_type}"));
+        }
+        let body = req.body_str();
+        for expected in [
+            "name=\"input\"",
+            "filename=\"paper.pdf\"",
+            "consolidateHeader",
+        ] {
+            if !body.contains(expected) {
+                return Err(format!("body missing {expected:?}"));
+            }
+        }
+        Ok(MockResponse::ok(&tei))
+    })
+    .await;
+
+    let client = test_client(addr, 1);
+    let document = client
+        .process_header_document(
+            PdfInput::Data {
+                filename: "paper.pdf".to_string(),
+                data: b"%PDF-1.4".to_vec(),
+            },
+            &Default::default(),
+        )
+        .await
+        .expect("process header");
+    assert_all_ok(&results);
+    assert_eq!(document.header.title.as_deref(), Some("Dummy Example File"));
+    assert_eq!(document.header.authors.len(), 2);
+    assert_eq!(document.header.authors[0].surname.as_deref(), Some("Kahle"));
+}
+
+#[tokio::test]
+async fn test_references() {
+    let tei = std::fs::read_to_string("testdata/citation_list/example.tei.xml").expect("fixture");
+    let (addr, results) = spawn_mock(move |req| {
+        if req.method != "POST" {
+            return Err(format!("method: {}", req.method));
+        }
+        if req.target != "/api/processReferences" {
+            return Err(format!("target: {}", req.target));
+        }
+        let body = req.body_str();
+        if !body.contains("includeRawCitations") {
+            return Err("body missing includeRawCitations".to_string());
+        }
+        Ok(MockResponse::ok(&tei))
+    })
+    .await;
+
+    let client = test_client(addr, 1);
+    let options = ProcessOptions {
+        include_raw_citations: true,
+        ..Default::default()
+    };
+    let citations = client
+        .process_references(
+            PdfInput::Data {
+                filename: "paper.pdf".to_string(),
+                data: b"%PDF-1.4".to_vec(),
+            },
+            &options,
+        )
+        .await
+        .expect("process references");
+    assert_all_ok(&results);
+    assert_eq!(citations.len(), 13);
+    assert_eq!(
+        citations[0].title.as_deref(),
+        Some("E-commerce: the challenge for UK SMEs in the twenty-first century")
+    );
+    assert_eq!(
+        citations[10].doi.as_deref(),
+        Some("10.1093/eurheartj/ehi890")
+    );
+}
+
+#[tokio::test]
+async fn test_pdf_raw() {
+    // The raw escape hatch passes the response body through untouched, so
+    // that services without a typed wrapper (e.g. the patent services) can
+    // be used.
+    let canned = "<biblStruct><monogr><title level=\"j\">Nat.Biotech</title></monogr></biblStruct>";
+    let (addr, results) = spawn_mock(move |req| {
+        if req.target != "/api/processCitationPatentST36" {
+            return Err(format!("target: {}", req.target));
+        }
+        let body = req.body_str();
+        if !body.contains("filename=\"patent.xml\"") {
+            return Err(format!("body missing filename: {body}"));
+        }
+        Ok(MockResponse::ok(canned))
+    })
+    .await;
+
+    let client = test_client(addr, 1);
+    let raw = client
+        .process_pdf_raw(
+            "processCitationPatentST36",
+            PdfInput::Data {
+                filename: "patent.xml".to_string(),
+                data: b"<patent/>".to_vec(),
+            },
+            &Default::default(),
+        )
+        .await
+        .expect("raw response");
+    assert_all_ok(&results);
+    assert_eq!(raw, canned);
+}
+
+#[tokio::test]
+async fn test_pdf_raw_no_content() {
+    let (addr, results) = spawn_mock(|_req| Ok(MockResponse::text(204, ""))).await;
+    let client = test_client(addr, 1);
+    let error = client
+        .process_pdf_raw(
+            "processFulltextDocument",
+            PdfInput::Data {
+                filename: "paper.pdf".to_string(),
+                data: b"%PDF-1.4".to_vec(),
+            },
+            &Default::default(),
+        )
+        .await
+        .expect_err("204 yields NoContent");
+    assert_all_ok(&results);
+    assert!(matches!(error, Error::NoContent));
+}
+
+#[tokio::test]
 async fn test_citation_list() {
     let tei = std::fs::read_to_string("testdata/citation_list/example.tei.xml").expect("fixture");
     let (addr, results) = spawn_mock(move |req| {
@@ -481,10 +627,15 @@ async fn test_http_error_status() {
     assert_all_ok(&results);
     match error {
         Error::HttpStatus {
-            status, message, ..
+            status,
+            url,
+            message,
         } => {
             assert_eq!(status, 500);
             assert_eq!(message, "the sky is falling");
+            // The reported URL is the full service URL, not a bare service
+            // name.
+            assert_eq!(url, format!("http://{addr}/api/processFulltextDocument"));
         }
         other => panic!("expected HttpStatus, got {other:?}"),
     }
@@ -536,5 +687,29 @@ fn test_base_url_normalization() {
         client.base_url().as_str(),
         "https://grobid.example.org/grobid/"
     );
-    assert!(GrobidClient::new("http://[::1").is_err());
+    assert!(matches!(
+        GrobidClient::new("http://[::1"),
+        Err(Error::InvalidBaseUrl { .. })
+    ));
+}
+
+#[test]
+fn test_base_url_rejects_non_http_schemes() {
+    // Schemes that are written in URL form are rejected with a dedicated
+    // error.
+    for url in ["ftp://example.com", "file:///tmp/grobid"] {
+        match GrobidClient::new(url) {
+            Err(Error::UnsupportedScheme { scheme, base_url }) => {
+                assert_eq!(base_url, url);
+                assert!(!scheme.is_empty());
+            }
+            other => panic!("expected UnsupportedScheme for {url:?}, got {other:?}"),
+        }
+    }
+    // A scheme without `//` is not recognizable as such; the string is
+    // treated as a `host:port` candidate and fails URL parsing instead.
+    assert!(matches!(
+        GrobidClient::new("data:text/plain,x"),
+        Err(Error::InvalidBaseUrl { .. })
+    ));
 }

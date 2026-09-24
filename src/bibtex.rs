@@ -137,10 +137,18 @@ pub fn to_entry(key: &str, biblio: &Biblio) -> Entry {
 }
 
 /// Render one record as a BibTeX entry.
+///
+/// This never fails: entries are built from typed values in [`to_entry`],
+/// and because the writer handles unparseable dates permissively (emitting
+/// them as a literal `date = {...}` field), the serializer cannot error on
+/// entries produced here.
 pub fn format_entry(key: &str, biblio: &Biblio) -> String {
-    to_entry(key, biblio)
-        .to_bibtex_string()
-        .expect("entries built from typed values always serialize")
+    match to_entry(key, biblio).to_bibtex_string() {
+        Ok(entry) => entry,
+        // Unreachable in practice; prefer a panicking expect over silently
+        // returning a truncated entry, because a bug here must be noticed.
+        Err(err) => unreachable!("entries built from typed values always serialize: {err}"),
+    }
 }
 
 /// Map GROBID authors onto typed BibLaTeX persons. Middle names are folded

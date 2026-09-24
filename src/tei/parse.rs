@@ -15,6 +15,7 @@
 use roxmltree::Node;
 
 use super::model::*;
+use crate::error::InvalidDocument;
 use crate::Error;
 
 /// Parse a full GROBID TEI document, as returned by e.g.
@@ -23,13 +24,13 @@ pub fn parse_document(xml: &str) -> Result<Document, Error> {
     let doc = roxmltree::Document::parse(xml)?;
     let root = doc.root_element();
     if !is_tag(&root, "TEI") {
-        return Err(Error::InvalidDocument("root element is not <TEI>"));
+        return Err(InvalidDocument::NotTei.into());
     }
     let Some(tei_header) = root.descendants().find(|n| is_tag(n, "teiHeader")) else {
-        return Err(Error::InvalidDocument("missing <teiHeader>"));
+        return Err(InvalidDocument::MissingTeiHeader.into());
     };
     let Some(app) = tei_header.descendants().find(|n| is_tag(n, "application")) else {
-        return Err(Error::InvalidDocument("missing <appInfo><application>"));
+        return Err(InvalidDocument::MissingApplication.into());
     };
 
     let header = Header {
@@ -626,4 +627,24 @@ fn clean_url(url: &str) -> String {
     let url = url.strip_prefix('<').unwrap_or(url);
     let url = url.split('>').next().unwrap_or(url);
     url.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_clean_url() {
+        let cases = [
+            ("", ""),
+            ("http://archive.org", "http://archive.org"),
+            ("http://archive.org.Lastaccessed", "http://archive.org"),
+            ("<http://archive.org.Lastaccessed", "http://archive.org"),
+            ("<http://example.org>", "http://example.org"),
+            ("  http://example.org  ", "http://example.org"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(clean_url(input), want, "input: {input:?}");
+        }
+    }
 }
