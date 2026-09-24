@@ -9,6 +9,7 @@ repository = "https://github.com/schmettow/grobid-rs"
 keywords = ["grobid", "tei", "scholarly", "pdf", "bibliography"]
 categories = ["science", "text-processing", "web-programming::http-client"]
 readme = "README.md"
+exclude = ["AGENTS.md"]
 
 [dependencies]
 biblatex = "0.12"
