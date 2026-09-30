@@ -12,8 +12,9 @@
 //! service with a bounded number of concurrent requests, and one BibTeX
 //! entry is written per document. With `-r`/`--rename`, each PDF is renamed
 //! to `Auth_Year_<first 10 title words>.pdf` once its metadata has been
-//! extracted. Documents that fail to process are reported on stderr and
-//! skipped.
+//! extracted; with `-l`/`--link`, every entry records the path of its PDF
+//! in a `file` field. Documents that fail to process are reported on stderr
+//! and skipped.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -51,6 +52,7 @@ Options:
   -s, --server <URL>    GROBID server URL [default: http://localhost:8070]
   -w, --workers <N>     number of concurrent requests [default: 4]
   -r, --rename          rename each PDF to Auth_Year_<first 10 title words>
+  -l, --link            add the PDF path as a file field to each entry
   -h, --help            print this help";
 
 struct Args {
@@ -59,6 +61,7 @@ struct Args {
     server_url: String,
     workers: usize,
     rename: bool,
+    link: bool,
 }
 
 #[tokio::main]
@@ -151,14 +154,22 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Assign deterministic, collision-free keys and format the entries.
-    let entries = format_entries(&results);
-    if entries.is_empty() && failures > 0 {
+    if results.is_empty() {
         return Err(format!(
             "all {failures} document(s) failed to process; check the server and the messages above"
         )
         .into());
     }
+
+    // Rename before formatting, so that `--link` entries point at the
+    // files' final locations. A failed rename keeps the original path, so
+    // the entry still refers to an existing file.
+    if args.rename {
+        rename_pdfs(&mut results);
+    }
+
+    // Assign deterministic, collision-free keys and format the entries.
+    let entries = format_entries(&results, args.link);
     let bibtex = entries
         .iter()
         .map(|(_, entry)| entry.as_str())
@@ -172,12 +183,6 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         args.output.display(),
         failures
     );
-
-    // Rename last, so that the extracted metadata is safely stored in the
-    // BibTeX file even if renaming is interrupted or fails.
-    if args.rename {
-        rename_pdfs(&results);
-    }
     Ok(())
 }
 
@@ -279,8 +284,10 @@ fn collect_pdfs(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Assign unique BibTeX keys and format all entries, sorted by key.
-fn format_entries(results: &[(PathBuf, Biblio)]) -> Vec<(PathBuf, String)> {
+/// Assign unique BibTeX keys and format all entries, sorted by key. With
+/// `link`, each entry records its PDF's path (as it is after renaming) in
+/// a `file` field.
+fn format_entries(results: &[(PathBuf, Biblio)], link: bool) -> Vec<(PathBuf, String)> {
     // Sort by suggested key (and path, for determinism) before assigning
     // collision-free keys.
     let mut keyed: Vec<(&Biblio, &PathBuf, String)> = results
@@ -294,36 +301,46 @@ fn format_entries(results: &[(PathBuf, Biblio)]) -> Vec<(PathBuf, String)> {
         .into_iter()
         .map(|(biblio, path, _)| {
             let key = bibtex::unique_key(biblio, &mut used);
-            (path.clone(), bibtex::format_entry(&key, biblio))
+            let entry = if link {
+                bibtex::format_entry_with_file(&key, biblio, path)
+            } else {
+                bibtex::format_entry(&key, biblio)
+            };
+            (path.clone(), entry)
         })
         .collect()
 }
 
 /// Rename every processed PDF to its [`rename_target`] name, keeping the
-/// original file extension. Files are handled in path order, so collision
-/// suffixes (`-2`, `-3`, ...) are deterministic; a PDF that already bears
-/// the requested name is left alone. Individual rename errors are reported
-/// on stderr and do not stop the batch.
-fn rename_pdfs(results: &[(PathBuf, Biblio)]) {
-    let mut ordered: Vec<&(PathBuf, Biblio)> = results.iter().collect();
-    ordered.sort_by(|a, b| a.0.cmp(&b.0));
+/// original file extension, and update `results` to the files' final
+/// locations (so that `--link` entries point at the renamed files). Files
+/// are handled in path order, so collision suffixes (`-2`, `-3`, ...) are
+/// deterministic; a PDF that already bears the requested name is left
+/// alone. Individual rename errors are reported on stderr and do not stop
+/// the batch.
+fn rename_pdfs(results: &mut [(PathBuf, Biblio)]) {
+    // Rename in path order so that collision suffixes are deterministic.
+    let mut order: Vec<usize> = (0..results.len()).collect();
+    order.sort_by(|&a, &b| results[a].0.cmp(&results[b].0));
     let mut renamed = 0usize;
-    for (path, biblio) in ordered {
-        let Some(target) = rename_target(path, biblio) else {
+    for index in order {
+        let path = results[index].0.clone();
+        let Some(target) = rename_target(&path, &results[index].1) else {
             eprintln!(
                 "warn: cannot rename {}: no author, year or title extracted",
                 path.display()
             );
             continue;
         };
-        if target.as_path() == path.as_path() {
+        if target == path {
             continue; // already named as requested
         }
         let target = first_free(target);
-        match std::fs::rename(path, &target) {
+        match std::fs::rename(&path, &target) {
             Ok(()) => {
                 renamed += 1;
                 println!("renamed: {} -> {}", path.display(), target.display());
+                results[index].0 = target;
             }
             Err(err) => eprintln!(
                 "warn: cannot rename {} to {}: {err}",
@@ -408,6 +425,7 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut server_url = grobid::DEFAULT_GROBID_URL.to_string();
     let mut workers = 4usize;
     let mut rename = false;
+    let mut link = false;
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < raw.len() {
@@ -418,6 +436,7 @@ fn parse_args() -> Result<Option<Args>, String> {
                 return Ok(None);
             }
             "-r" | "--rename" => rename = true,
+            "-l" | "--link" => link = true,
             "-o" | "--output" | "-s" | "--server" | "-w" | "--workers" => {
                 i += 1;
                 let Some(value) = raw.get(i) else {
@@ -469,6 +488,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         server_url,
         workers,
         rename,
+        link,
     }))
 }
 
@@ -521,7 +541,7 @@ mod tests {
             (PathBuf::from("a.pdf"), make("Smith")),
             (PathBuf::from("c.pdf"), make("Jones")),
         ];
-        let entries = format_entries(&results);
+        let entries = format_entries(&results, false);
         let keys: Vec<&str> = entries
             .iter()
             .map(|(_, entry)| entry.lines().next().unwrap())
@@ -530,6 +550,28 @@ mod tests {
             keys,
             vec!["@misc{Jones2020,", "@misc{Smith2020,", "@misc{Smith2020-2,"]
         );
+    }
+
+    #[test]
+    fn test_format_entries_link() {
+        let biblio = Biblio {
+            authors: vec![grobid::Author {
+                surname: Some("Smith".to_string()),
+                ..grobid::Author::default()
+            }],
+            date: Some("2020".to_string()),
+            title: Some("A title".to_string()),
+            ..Biblio::default()
+        };
+        let results = vec![(PathBuf::from("papers/a.pdf"), biblio)];
+        let linked = format_entries(&results, true);
+        assert!(
+            linked[0].1.contains("file = {papers/a.pdf},"),
+            "{}",
+            linked[0].1
+        );
+        let plain = format_entries(&results, false);
+        assert!(!plain[0].1.contains("file = "), "{}", plain[0].1);
     }
 
     #[test]
@@ -603,8 +645,8 @@ mod tests {
         };
         // Both records map to the same name; the first in path order gets
         // the plain name, the second a `-2` suffix.
-        let results = vec![(make("b.pdf"), biblio()), (make("a.pdf"), biblio())];
-        rename_pdfs(&results);
+        let mut results = vec![(make("b.pdf"), biblio()), (make("a.pdf"), biblio())];
+        rename_pdfs(&mut results);
         let mut names: Vec<String> = std::fs::read_dir(&dir)
             .expect("read temp dir")
             .map(|entry| entry.expect("dir entry").file_name().into_string().unwrap())
@@ -614,6 +656,13 @@ mod tests {
             names,
             vec!["Smith_2020_Same_title-2.pdf", "Smith_2020_Same_title.pdf"]
         );
+        // The results now point at the renamed files, for `--link` output.
+        let mut paths: Vec<String> = results
+            .iter()
+            .map(|(path, _)| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        paths.sort();
+        assert_eq!(paths, names);
         std::fs::remove_dir_all(&dir).expect("remove temp dir");
     }
 }

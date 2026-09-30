@@ -177,6 +177,11 @@ extracted to `Author_Year_<first 10 title words>.pdf`, e.g.
 not extract (author, year or title) are dropped, non-ASCII characters are
 removed, and colliding names get a `-2`, `-3`, ... suffix.
 
+With `-l`/`--link`, each entry records the path of its PDF in a `file`
+field, so reference managers can open the document; combined with
+`-r`/`--rename`, the field points at the renamed file. Paths are recorded
+as passed on the command line, so relative input paths stay relative.
+
 ### refs2bibtex
 
 The `refs2bibtex` example extracts the bibliographic *references* of all PDFs

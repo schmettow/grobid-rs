@@ -10,6 +10,7 @@
 //! The `pdf2bibtex` and `refs2bibtex` examples use these helpers.
 
 use std::collections::HashSet;
+use std::path::Path;
 
 use biblatex::{Chunk, Date, DateValue, Datetime, Entry, EntryType, Person, Spanned};
 
@@ -253,7 +254,51 @@ pub fn to_entry(key: &str, biblio: &Biblio) -> Entry {
 /// The internal assertion on that invariant exists so that a future
 /// regression surfaces as a panic instead of a silently truncated entry.
 pub fn format_entry(key: &str, biblio: &Biblio) -> String {
-    match to_entry(key, biblio).to_bibtex_string() {
+    render(to_entry(key, biblio))
+}
+
+/// Render one record as a BibTeX entry with a `file` field.
+///
+/// Like [`format_entry`], but records `file` (typically the path of the
+/// document the metadata was extracted from) in the entry's `file` field,
+/// so that reference managers can open the document. The path is written
+/// verbatim; relative paths are kept as given.
+///
+/// ```
+/// use grobid::{bibtex, Author, Biblio};
+///
+/// let biblio = Biblio {
+///     authors: vec![Author {
+///         given_name: Some("Brewster".to_string()),
+///         surname: Some("Kahle".to_string()),
+///         ..Author::default()
+///     }],
+///     title: Some("Dummy Example File".to_string()),
+///     date: Some("2000".to_string()),
+///     ..Biblio::default()
+/// };
+///
+/// let entry = bibtex::format_entry_with_file("kahle2000", &biblio, "/papers/kahle2000.pdf");
+/// assert!(entry.contains("file = {/papers/kahle2000.pdf},"));
+/// ```
+///
+/// # Panics
+///
+/// See [`format_entry`]: entries built from typed values always serialize.
+pub fn format_entry_with_file(key: &str, biblio: &Biblio, file: impl AsRef<Path>) -> String {
+    let mut entry = to_entry(key, biblio);
+    entry.set(
+        "file",
+        vec![Spanned::detached(Chunk::Normal(
+            file.as_ref().to_string_lossy().into_owned(),
+        ))],
+    );
+    render(entry)
+}
+
+/// Serialize an entry, treating a serialization failure as a bug.
+fn render(entry: Entry) -> String {
+    match entry.to_bibtex_string() {
         Ok(entry) => entry,
         // Unreachable in practice; prefer a panicking expect over silently
         // returning a truncated entry, because a bug here must be noticed.
@@ -459,6 +504,24 @@ mod tests {
         assert!(entry.contains("year = {2000},"));
         assert!(entry.contains("volume = {20},"));
         assert!(entry.ends_with('}'));
+    }
+
+    #[test]
+    fn test_format_entry_with_file() {
+        let mut biblio = Biblio::default();
+        biblio.authors.push(author("Kahle", Some("Brewster")));
+        biblio.title = Some("Dummy Example File".to_string());
+        biblio.date = Some("2000".to_string());
+
+        let entry = format_entry_with_file("kahle2000", &biblio, "/papers/kahle2000.pdf");
+        assert!(entry.contains("file = {/papers/kahle2000.pdf},"), "{entry}");
+        // The field is read back verbatim, e.g. by a reference manager.
+        let bibliography = biblatex::Bibliography::parse(&entry).expect("parse output");
+        let parsed = bibliography.get("kahle2000").expect("entry by key");
+        assert_eq!(
+            parsed.get("file").expect("file").format_verbatim(),
+            "/papers/kahle2000.pdf"
+        );
     }
 
     #[test]
