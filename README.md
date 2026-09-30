@@ -171,6 +171,12 @@ extracted bibliographic metadata as a BibTeX file, one entry per document
 cargo run --release --example pdf2bibtex -- ~/papers -s http://localhost:8070
 ```
 
+With `-r`/`--rename`, each PDF is renamed after its metadata has been
+extracted to `Author_Year_<first 10 title words>.pdf`, e.g.
+`Kahle_2000_The_Barc_model_for_continuous_variables.pdf`. Parts GROBID could
+not extract (author, year or title) are dropped, non-ASCII characters are
+removed, and colliding names get a `-2`, `-3`, ... suffix.
+
 ### refs2bibtex
 
 The `refs2bibtex` example extracts the bibliographic *references* of all PDFs
