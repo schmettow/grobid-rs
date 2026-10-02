@@ -27,6 +27,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   example with `--features openalex`), extracted references respectively
   document headers are completed against OpenAlex after parsing.
 
+### Fixed
+
+- Reference completion no longer fails on titles that contain OpenAlex
+  filter syntax: commas, pipes (`|`), exclamation marks, quotes and wildcards
+  (`*`, `?`) are replaced by spaces before the title is sent as a search
+  term, so titles such as `Sexual selection, sensory systems and sensory
+  exploitation` or a title with a stray trailing `*` complete instead of
+  being rejected with HTTP 400 (or silently turned into a broader query).
+
 ## [0.2.0] - 2026-10-02
 
 ### Added

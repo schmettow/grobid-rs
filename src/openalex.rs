@@ -10,7 +10,10 @@
 //! Existing fields are never overwritten: completion only fills gaps. A
 //! search result is accepted only when title, publication year and first
 //! author are compatible with the parsed reference, so a lookup that cannot
-//! be verified leaves the reference unchanged. The heuristics behind that are
+//! be verified leaves the reference unchanged. Parsed titles are sanitized
+//! before they are sent as search terms, so punctuation that OpenAlex's
+//! filter syntax treats specially (commas, pipes, wildcards, ...) neither
+//! rejects the request nor broadens the query. The heuristics behind this are
 //! pinned by an extensive test suite; tests marked `#[ignore]` document their
 //! known weaknesses.
 //!
@@ -62,8 +65,8 @@ pub const DEFAULT_OPENALEX_URL: &str = "https://api.openalex.org";
 /// Number of OpenAlex search results considered for a title match.
 const SEARCH_LIMIT: u32 = 10;
 
-/// Titles shorter than this are not searched for, as too little text would
-/// make a false-positive match likely.
+/// Search terms shorter than this are not searched for, as too little text
+/// would make a false-positive match likely.
 const MIN_TITLE_LEN: usize = 8;
 
 /// The shorter of two normalized titles must be at least this long for a
@@ -241,15 +244,14 @@ impl Completer {
             }
         }
 
-        let Some(title) = biblio
-            .title
-            .as_deref()
-            .map(str::trim)
-            .filter(|title| title.chars().count() >= MIN_TITLE_LEN)
-        else {
+        let Some(title) = biblio.title.as_deref() else {
             return Ok(None);
         };
-        let candidates = self.search_by_title(title).await?;
+        let term = sanitize_search_term(title);
+        if term.chars().count() < MIN_TITLE_LEN {
+            return Ok(None);
+        }
+        let candidates = self.search_by_title(&term).await?;
         Ok(select_match(biblio, candidates).map(|work| (work, MatchKind::Title)))
     }
 
@@ -518,6 +520,25 @@ fn titles_match(parsed: &str, candidate: &str) -> bool {
         (candidate.as_str(), parsed.as_str())
     };
     shorter.chars().count() >= CONTAINMENT_MIN_TITLE_LEN && longer.contains(shorter)
+}
+
+/// Sanitize a parsed title for the OpenAlex `title.search` filter.
+///
+/// OpenAlex's filter syntax gives `,`, `|` and `!` special meaning and
+/// treats `"` as phrase quoting; `*` and `?` are wildcards that the stemmed
+/// search rejects outright (HTTP 400). All of them are replaced by spaces,
+/// which leaves a plain token query: the punctuation carries no meaning for
+/// title matching, which the local compatibility checks do. Characters that
+/// the filter parser treats literally (e.g. `:`, `<`, `=`, `%`) are kept.
+fn sanitize_search_term(raw: &str) -> String {
+    let replaced: String = raw
+        .chars()
+        .map(|c| match c {
+            ',' | '|' | '!' | '"' | '*' | '?' => ' ',
+            other => other,
+        })
+        .collect();
+    replaced.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Lowercase a string, keep alphanumerics and collapse everything else into
@@ -968,6 +989,31 @@ mod tests {
         assert_eq!(normalize_title("ÄÖÜ"), "äöü");
         assert_eq!(normalize_title("!!!"), "");
         assert_eq!(normalize_title(""), "");
+    }
+
+    #[test]
+    fn test_sanitize_search_term() {
+        // Filter syntax characters are replaced by spaces.
+        assert_eq!(
+            sanitize_search_term("Sexual selection, sensory systems and sensory exploitation"),
+            "Sexual selection sensory systems and sensory exploitation"
+        );
+        assert_eq!(
+            sanitize_search_term("Newborns' preferential tracking ... decline*"),
+            "Newborns' preferential tracking ... decline"
+        );
+        assert_eq!(
+            sanitize_search_term("alpha|beta!gamma\"delta*epsilon?zeta"),
+            "alpha beta gamma delta epsilon zeta"
+        );
+        // Whitespace is collapsed and trimmed.
+        assert_eq!(sanitize_search_term("  a ,  b  "), "a b");
+        // Characters that OpenAlex treats literally are kept.
+        assert_eq!(
+            sanitize_search_term("p < 0.05: 95% of C++"),
+            "p < 0.05: 95% of C++"
+        );
+        assert_eq!(sanitize_search_term("!!!"), "");
     }
 
     #[test]

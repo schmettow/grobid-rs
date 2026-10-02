@@ -201,6 +201,24 @@ const WRONG_CANDIDATE: &str = r#"{
     "authorships": [{"author": {"display_name": "Someone Else"}}]
 }"#;
 
+/// A work whose title contains a comma, the case that produced an HTTP 400
+/// from OpenAlex's filter parser (the comma separates filters).
+const COMMA_WORK: &str = r#"{
+    "id": "https://openalex.org/W63174745",
+    "title": "Sexual selection, sensory systems and sensory exploitation.",
+    "publication_year": 1990,
+    "authorships": [{"author": {"display_name": "Michael J. Ryan"}}]
+}"#;
+
+/// A work whose title carries a stray `*` from the parsed reference, the
+/// case that produced the wildcard HTTP 400 for the stemmed title search.
+const WILDCARD_WORK: &str = r#"{
+    "id": "https://openalex.org/W2145765358",
+    "title": "Newborns' preferential tracking of face-like stimuli and its subsequent decline",
+    "publication_year": 1991,
+    "authorships": [{"author": {"display_name": "Mark H. Johnson"}}]
+}"#;
+
 fn search_response(works: &str) -> String {
     format!(
         r#"{{"meta": {{"count": 1, "db_response_time_ms": 5, "page": 1, "per_page": 5, "groups_count": null}}, "results": [{works}]}}"#
@@ -490,4 +508,91 @@ async fn test_doi_is_percent_encoded_in_the_path() {
         "target: {}",
         targets[0]
     );
+}
+
+#[tokio::test]
+async fn test_title_with_comma_is_sanitized_for_the_filter() {
+    let (addr, requests) = spawn_mock(|_| MockResponse::ok(search_response(COMMA_WORK))).await;
+    let biblio = Biblio {
+        title: Some("Sexual selection, sensory systems and sensory exploitation".to_string()),
+        date: Some("1990".to_string()),
+        authors: vec![Author {
+            surname: Some("Ryan".to_string()),
+            ..Author::default()
+        }],
+        ..Biblio::default()
+    };
+
+    let completion = completer(addr)
+        .complete(&biblio)
+        .await
+        .expect("request")
+        .expect("match");
+    assert_eq!(completion.matched_by, MatchKind::Title);
+
+    let targets = requests.lock().expect("lock");
+    assert_eq!(targets.len(), 1);
+    // The comma is gone from the filter value, so the API edge accepts it.
+    assert!(
+        targets[0].contains(
+            "filter=title.search%3ASexual+selection+sensory+systems+and+sensory+exploitation"
+        ),
+        "target: {}",
+        targets[0]
+    );
+    assert!(!targets[0].contains(','), "target: {}", targets[0]);
+    assert!(!targets[0].contains("%2C"), "target: {}", targets[0]);
+}
+
+#[tokio::test]
+async fn test_title_with_wildcard_is_sanitized() {
+    let (addr, requests) = spawn_mock(|_| MockResponse::ok(search_response(WILDCARD_WORK))).await;
+    let biblio = Biblio {
+        title: Some(
+            "Newborns' preferential tracking of face-like stimuli and its subsequent decline*"
+                .to_string(),
+        ),
+        date: Some("1991".to_string()),
+        authors: vec![Author {
+            surname: Some("Johnson".to_string()),
+            ..Author::default()
+        }],
+        ..Biblio::default()
+    };
+
+    let completion = completer(addr)
+        .complete(&biblio)
+        .await
+        .expect("request")
+        .expect("match");
+    assert_eq!(completion.matched_by, MatchKind::Title);
+
+    let targets = requests.lock().expect("lock");
+    assert_eq!(targets.len(), 1);
+    // The wildcard is gone; the apostrophe is percent-encoded as usual.
+    assert!(
+        targets[0].contains("filter=title.search%3ANewborns%27+preferential+tracking"),
+        "target: {}",
+        targets[0]
+    );
+    assert!(
+        targets[0].contains("subsequent+decline"),
+        "target: {}",
+        targets[0]
+    );
+    assert!(!targets[0].contains('*'), "target: {}", targets[0]);
+    assert!(!targets[0].contains("%3F"), "target: {}", targets[0]);
+}
+
+#[tokio::test]
+async fn test_title_of_only_filter_characters_is_not_searched() {
+    let (addr, requests) = spawn_mock(|_| MockResponse::ok(search_response(WORK))).await;
+    let biblio = Biblio {
+        title: Some(",,,,,,,,,,,,,,,,".to_string()),
+        ..Biblio::default()
+    };
+
+    let completion = completer(addr).complete(&biblio).await.expect("no request");
+    assert!(completion.is_none());
+    assert!(requests.lock().expect("lock").is_empty());
 }

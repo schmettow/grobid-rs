@@ -158,9 +158,11 @@ reference. Lookups require HTTPS access to `api.openalex.org`; they use the
 async `reqwest` client this crate already depends on, so no external OpenAlex
 client is required. Responses are parsed into a small, deliberately tolerant
 in-house model: unknown, missing and `null` fields are ignored, so unrelated
-OpenAlex schema changes do not break completion. The matching heuristics are
-pinned by an extensive test suite, with known weaknesses documented as
-ignored tests.
+OpenAlex schema changes do not break completion. Titles are sanitized for
+OpenAlex's filter syntax before they are sent as search terms, so punctuation
+such as commas, pipes or wildcards does not break the lookup either. The
+matching heuristics are pinned by an extensive test suite, with known
+weaknesses documented as ignored tests.
 
 Enable the feature in `Cargo.toml`:
 
