@@ -1,6 +1,6 @@
 [package]
 name = "grobid"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Native Rust client for the GROBID REST API with a strongly typed TEI parser"
@@ -13,11 +13,11 @@ exclude = ["AGENTS.md"]
 
 [dependencies]
 biblatex = "0.12"
-reqwest = { version = "0.12", default-features = false, features = [
+reqwest = { version = "0.13", default-features = false, features = [
     "multipart",
-    "rustls-tls",
+    "rustls",
 ] }
-roxmltree = "0.20"
+roxmltree = "0.21"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "time"] }
