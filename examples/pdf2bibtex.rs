@@ -14,7 +14,9 @@
 //! to `Auth_Year_<first 10 title words>.pdf` once its metadata has been
 //! extracted; with `-l`/`--link`, every entry records the path of its PDF
 //! in a `file` field. Documents that fail to process are reported on stderr
-//! and skipped.
+//! and skipped. When built with the `openalex` feature, `--openalex` adds a
+//! second completion tier against OpenAlex: headers are completed before
+//! entries are formatted and PDFs are renamed.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -53,6 +55,8 @@ Options:
   -w, --workers <N>     number of concurrent requests [default: 4]
   -r, --rename          rename each PDF to Auth_Year_<first 10 title words>
   -l, --link            add the PDF path as a file field to each entry
+      --openalex        complete headers against OpenAlex; requires
+                        building with --features openalex
   -h, --help            print this help";
 
 struct Args {
@@ -62,6 +66,7 @@ struct Args {
     workers: usize,
     rename: bool,
     link: bool,
+    openalex: bool,
 }
 
 #[tokio::main]
@@ -113,12 +118,23 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .http_client(http)
         .build();
 
+    let mut notes = Vec::new();
+    if args.rename {
+        notes.push("renaming PDFs");
+    }
+    if args.openalex {
+        notes.push("OpenAlex completion");
+    }
+    let notes = if notes.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", notes.join(", "))
+    };
     println!(
-        "processing {} PDF(s) from {} with {} worker(s){}",
+        "processing {} PDF(s) from {} with {} worker(s){notes}",
         pdfs.len(),
         args.input_dir.display(),
-        args.workers,
-        if args.rename { " (renaming PDFs)" } else { "" }
+        args.workers
     );
 
     let options = ProcessOptions::default();
@@ -159,6 +175,13 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             "all {failures} document(s) failed to process; check the server and the messages above"
         )
         .into());
+    }
+
+    // Second tier: fill the gaps GROBID left behind from OpenAlex, before
+    // renaming so that file names are built from the completed metadata.
+    #[cfg(feature = "openalex")]
+    if args.openalex {
+        results = complete_headers(results, args.workers).await?;
     }
 
     // Rename before formatting, so that `--link` entries point at the
@@ -419,6 +442,64 @@ fn sanitize(text: &str) -> String {
     text.chars().filter(char::is_ascii_alphanumeric).collect()
 }
 
+/// Complete the extracted document headers against OpenAlex.
+///
+/// Each header is looked up independently, with the same worker bound as the
+/// GROBID requests. Lookups that fail are reported and leave the header
+/// unchanged, so an unreachable or rate-limited OpenAlex API does not lose
+/// data. The order of `results` is kept.
+#[cfg(feature = "openalex")]
+async fn complete_headers(
+    results: Vec<(PathBuf, Biblio)>,
+    workers: usize,
+) -> Result<Vec<(PathBuf, Biblio)>, Box<dyn std::error::Error>> {
+    let total = results.len();
+    let completer = grobid::openalex::Completer::new();
+    let semaphore = Arc::new(Semaphore::new(workers));
+    let mut tasks = JoinSet::new();
+    for (index, (path, biblio)) in results.into_iter().enumerate() {
+        let completer = completer.clone();
+        let semaphore = Arc::clone(&semaphore);
+        tasks.spawn(async move {
+            // Bound the number of concurrent OpenAlex lookups.
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .expect("semaphore not closed");
+            let outcome = completer.complete(&biblio).await;
+            (index, path, biblio, outcome)
+        });
+        // OpenAlex asks the common (keyless) pool for at most 10 requests
+        // per second, so pace the dispatch of the workers.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let mut completed = Vec::with_capacity(total);
+    let mut matched = 0usize;
+    let mut failed = 0usize;
+    while let Some(joined) = tasks.join_next().await {
+        let (index, path, mut biblio, outcome) = joined.expect("worker task panicked");
+        match outcome {
+            Ok(Some(completion)) => {
+                matched += 1;
+                biblio = completion.biblio;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                failed += 1;
+                eprintln!("openalex: {}: {err}", path.display());
+            }
+        }
+        completed.push((index, path, biblio));
+    }
+    completed.sort_by_key(|(index, _, _)| *index);
+    println!("openalex: matched {matched} of {total} document(s) ({failed} lookup(s) failed)");
+    Ok(completed
+        .into_iter()
+        .map(|(_, path, biblio)| (path, biblio))
+        .collect())
+}
+
 fn parse_args() -> Result<Option<Args>, String> {
     let mut input_dir: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
@@ -426,6 +507,10 @@ fn parse_args() -> Result<Option<Args>, String> {
     let mut workers = 4usize;
     let mut rename = false;
     let mut link = false;
+    #[cfg(feature = "openalex")]
+    let mut openalex = false;
+    #[cfg(not(feature = "openalex"))]
+    let openalex = false;
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < raw.len() {
@@ -437,6 +522,18 @@ fn parse_args() -> Result<Option<Args>, String> {
             }
             "-r" | "--rename" => rename = true,
             "-l" | "--link" => link = true,
+            "--openalex" => {
+                #[cfg(not(feature = "openalex"))]
+                {
+                    return Err("--openalex requires the `openalex` feature; rebuild with \
+                                `cargo run --features openalex --example pdf2bibtex`"
+                        .to_string());
+                }
+                #[cfg(feature = "openalex")]
+                {
+                    openalex = true;
+                }
+            }
             "-o" | "--output" | "-s" | "--server" | "-w" | "--workers" => {
                 i += 1;
                 let Some(value) = raw.get(i) else {
@@ -489,6 +586,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         workers,
         rename,
         link,
+        openalex,
     }))
 }
 

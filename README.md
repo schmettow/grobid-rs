@@ -221,6 +221,12 @@ field, so reference managers can open the document; combined with
 `-r`/`--rename`, the field points at the renamed file. Paths are recorded
 as passed on the command line, so relative input paths stay relative.
 
+With `--openalex` (requires building the example with `--features openalex`),
+each extracted header is completed against OpenAlex before entries are
+written and PDFs are renamed: missing authors, journal, volume, pages, DOI,
+... are filled in from the matching work. See *Reference completion against
+OpenAlex* above.
+
 ### refs2bibtex
 
 The `refs2bibtex` example extracts the bibliographic *references* of all PDFs
@@ -241,13 +247,14 @@ metadata via the `grobid::bibtex` helpers, which render records as typed
 BibLaTeX entries using the [`biblatex`](https://crates.io/crates/biblatex)
 crate (proper escaping, typed person lists and dates). `refs2bibtex` skips
 empty parse results and drops references with a duplicate DOI, and supports
-reference consolidation against CrossRef with `-c/--consolidate`. Built with
-`--features openalex`, it can additionally complete the collected references
-against OpenAlex with `--openalex` (see *Reference completion against OpenAlex*
-above):
+reference consolidation against CrossRef with `-c/--consolidate`. Both examples
+accept `--openalex` when built with `--features openalex`: `refs2bibtex`
+completes the collected references, `pdf2bibtex` each document header, before
+the entries are written (see *Reference completion against OpenAlex* above):
 
 ```sh
 cargo run --release --features openalex --example refs2bibtex -- ~/papers --openalex
+cargo run --release --features openalex --example pdf2bibtex -- ~/papers --openalex
 ```
 
 Run either example with `--help` for all options.

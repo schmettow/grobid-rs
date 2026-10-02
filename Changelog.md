@@ -23,9 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ignored tests.
 - `Roadmap.md`: the next steps beyond this release (OpenAlex client choice,
   CLI examples, Ragrig connector, output adapters).
-- `refs2bibtex`: `--openalex` completes the collected references against
-  OpenAlex after parsing; the flag requires building the example with
-  `--features openalex`.
+- `refs2bibtex` and `pdf2bibtex`: with `--openalex` (requires building the
+  example with `--features openalex`), extracted references respectively
+  document headers are completed against OpenAlex after parsing.
 
 ## [0.2.0] - 2026-10-02
 
