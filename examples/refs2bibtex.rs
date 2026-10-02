@@ -11,8 +11,11 @@
 //! (its header), this example writes one entry per reference found in the
 //! documents (via `/api/processReferences`). References with an empty parse
 //! result are skipped, references with the same DOI are deduplicated across
-//! documents, and citation keys are made unique. Run with `--help` for all
-//! options.
+//! documents, and citation keys are made unique. With `-c`/`--consolidate`
+//! GROBID consolidates the references against CrossRef while processing;
+//! when the example is built with the `openalex` feature, `--openalex` adds a
+//! second completion tier against OpenAlex after parsing. Run with `--help`
+//! for all options.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -53,6 +56,8 @@ Options:
   -s, --server <URL>    GROBID server URL [default: http://localhost:8070]
   -w, --workers <N>     number of concurrent requests [default: 4]
   -c, --consolidate     consolidate references against CrossRef
+      --openalex        complete references against OpenAlex; requires
+                        building with --features openalex
   -h, --help            print this help";
 
 struct Args {
@@ -61,6 +66,7 @@ struct Args {
     server_url: String,
     workers: usize,
     consolidate: bool,
+    openalex: bool,
 }
 
 #[tokio::main]
@@ -112,16 +118,23 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .http_client(http)
         .build();
 
+    let mut tiers = Vec::new();
+    if args.consolidate {
+        tiers.push("consolidated");
+    }
+    if args.openalex {
+        tiers.push("OpenAlex completion");
+    }
+    let tiers = if tiers.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", tiers.join(", "))
+    };
     println!(
-        "extracting references from {} PDF(s) in {} with {} worker(s){}",
+        "extracting references from {} PDF(s) in {} with {} worker(s){tiers}",
         pdfs.len(),
         args.input_dir.display(),
-        args.workers,
-        if args.consolidate {
-            " (consolidated)"
-        } else {
-            ""
-        }
+        args.workers
     );
 
     let options = ProcessOptions {
@@ -186,7 +199,16 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    let entries = format_all(&collected.citations);
+    // Second tier: fill the gaps GROBID left behind from OpenAlex.
+    let citations = collected.citations;
+    #[cfg(feature = "openalex")]
+    let citations = if args.openalex {
+        complete_references(citations, args.workers).await?
+    } else {
+        citations
+    };
+
+    let entries = format_all(&citations);
     let bibtex = entries.join("\n\n");
     std::fs::write(&args.output, format!("{bibtex}\n"))?;
     println!(
@@ -354,12 +376,80 @@ fn format_all(citations: &[Citation]) -> Vec<String> {
         .collect()
 }
 
+/// Complete the collected references against OpenAlex.
+///
+/// Each reference is looked up independently, with the same worker bound as
+/// the GROBID requests. Lookups that fail are reported and leave the
+/// reference unchanged, so an unreachable or rate-limited OpenAlex API does
+/// not lose data. The deterministic order of `collect_entries` is kept.
+#[cfg(feature = "openalex")]
+async fn complete_references(
+    citations: Vec<Citation>,
+    workers: usize,
+) -> Result<Vec<Citation>, Box<dyn std::error::Error>> {
+    let total = citations.len();
+    let completer = grobid::openalex::Completer::new();
+    let semaphore = Arc::new(Semaphore::new(workers));
+    let mut tasks = JoinSet::new();
+    for (index, citation) in citations.into_iter().enumerate() {
+        let completer = completer.clone();
+        let semaphore = Arc::clone(&semaphore);
+        tasks.spawn(async move {
+            // Bound the number of concurrent OpenAlex lookups.
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .expect("semaphore not closed");
+            let outcome = completer.complete(&citation.biblio).await;
+            (index, citation, outcome)
+        });
+        // OpenAlex asks the common (keyless) pool for at most 10 requests
+        // per second, so pace the dispatch of the workers.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let mut completed = Vec::with_capacity(total);
+    let mut matched = 0usize;
+    let mut failed = 0usize;
+    while let Some(joined) = tasks.join_next().await {
+        let (index, mut citation, outcome) = joined.expect("worker task panicked");
+        match outcome {
+            Ok(Some(completion)) => {
+                matched += 1;
+                citation.biblio = completion.biblio;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                failed += 1;
+                eprintln!("openalex: reference {}: {err}", index + 1);
+            }
+        }
+        completed.push((index, citation));
+    }
+    completed.sort_by_key(|(index, _)| *index);
+    println!("openalex: matched {matched} of {total} reference(s) ({failed} lookup(s) failed)");
+
+    let mut citations: Vec<Citation> = completed
+        .into_iter()
+        .map(|(_, citation)| citation)
+        .collect();
+    // Completion can fill in author and year, changing the suggested keys;
+    // keep the output ordered by key. The sort is stable, so references with
+    // equal keys keep their deterministic pre-completion order.
+    citations.sort_by_cached_key(|citation| bibtex::suggest_key(citation));
+    Ok(citations)
+}
+
 fn parse_args() -> Result<Option<Args>, String> {
     let mut input_dir: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
     let mut server_url = grobid::DEFAULT_GROBID_URL.to_string();
     let mut workers = 4usize;
     let mut consolidate = false;
+    #[cfg(feature = "openalex")]
+    let mut openalex = false;
+    #[cfg(not(feature = "openalex"))]
+    let openalex = false;
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < raw.len() {
@@ -370,6 +460,18 @@ fn parse_args() -> Result<Option<Args>, String> {
                 return Ok(None);
             }
             "-c" | "--consolidate" => consolidate = true,
+            "--openalex" => {
+                #[cfg(not(feature = "openalex"))]
+                {
+                    return Err("--openalex requires the `openalex` feature; rebuild with \
+                                `cargo run --features openalex --example refs2bibtex`"
+                        .to_string());
+                }
+                #[cfg(feature = "openalex")]
+                {
+                    openalex = true;
+                }
+            }
             "-o" | "--output" | "-s" | "--server" | "-w" | "--workers" => {
                 i += 1;
                 let Some(value) = raw.get(i) else {
@@ -421,6 +523,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         server_url,
         workers,
         consolidate,
+        openalex,
     }))
 }
 

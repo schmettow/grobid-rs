@@ -12,7 +12,10 @@ raw documents such as PDFs into structured TEI-XML. This crate provides:
 - a **TEI parser** that turns GROBID responses into strongly typed Rust
   structures, exposing the full document hierarchy (sections, paragraphs,
   figures, formulas, footnotes, lists), bibliographic metadata, citations,
-  references and optional PDF coordinates.
+  references and optional PDF coordinates,
+- optional **second-tier reference completion against OpenAlex** (the
+  `openalex` feature), filling in missing fields of parsed references by DOI
+  or title lookup.
 
 The client behaviour follows the official
 [Python client](https://github.com/grobidOrg/grobid-client-python); the TEI
@@ -143,6 +146,40 @@ fn example(xml: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### Reference completion against OpenAlex (optional)
+
+With the `openalex` feature, parsed references can be completed against
+[OpenAlex](https://openalex.org/): a reference is looked up by DOI when one
+was parsed, otherwise by title, and missing fields — authors, journal, volume,
+pages, DOI, PubMed ID, ... — are filled in from the matching work. Existing
+fields are never overwritten, and a search result is accepted only when
+title, publication year and first author are compatible with the parsed
+reference. Lookups require HTTPS access to `api.openalex.org`. They use the
+[`openalex`](https://crates.io/crates/openalex) crate for its typed work
+model; because that crate (0.2.2) predates current OpenAlex API schema
+changes, the requests are made with async `reqwest` and the known schema
+drift is repaired before deserialization.
+
+Enable the feature in `Cargo.toml`:
+
+```toml
+grobid = { version = "0.2", features = ["openalex"] }
+```
+
+```rust,ignore
+use grobid::openalex::Completer;
+use grobid::Biblio;
+
+async fn example(biblio: Biblio) -> Result<(), Box<dyn std::error::Error>> {
+    let completer = Completer::new();
+    if let Some(completion) = completer.complete(&biblio).await? {
+        let completed: Biblio = completion.biblio;
+        println!("matched {} by {:?}", completion.openalex_id, completion.matched_by);
+    }
+    Ok(())
+}
+```
+
 ## Coordinates
 
 When `tei_coordinates` is requested, GROBID adds a `@coords` attribute to the
@@ -202,8 +239,16 @@ metadata via the `grobid::bibtex` helpers, which render records as typed
 BibLaTeX entries using the [`biblatex`](https://crates.io/crates/biblatex)
 crate (proper escaping, typed person lists and dates). `refs2bibtex` skips
 empty parse results and drops references with a duplicate DOI, and supports
-reference consolidation against CrossRef with `-c/--consolidate`. Run either
-example with `--help` for all options.
+reference consolidation against CrossRef with `-c/--consolidate`. Built with
+`--features openalex`, it can additionally complete the collected references
+against OpenAlex with `--openalex` (see *Reference completion against OpenAlex*
+above):
+
+```sh
+cargo run --release --features openalex --example refs2bibtex -- ~/papers --openalex
+```
+
+Run either example with `--help` for all options.
 
 ## The GROBID server
 

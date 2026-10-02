@@ -12,7 +12,9 @@
 //! * a TEI parser that turns GROBID responses into strongly typed Rust
 //!   structures ([`Document`], [`Biblio`], [`Citation`], ...), exposing the
 //!   full document hierarchy, bibliographic metadata, references and
-//!   optional PDF coordinates.
+//!   optional PDF coordinates,
+//! * optional second-tier completion of parsed references against OpenAlex
+//!   (`openalex` feature).
 //!
 //! ## Example
 //!
@@ -79,6 +81,8 @@
 pub mod bibtex;
 mod client;
 mod error;
+#[cfg(feature = "openalex")]
+pub mod openalex;
 pub mod tei;
 
 pub use client::{

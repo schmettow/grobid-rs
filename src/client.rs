@@ -108,6 +108,10 @@ impl HeaderConsolidation {
 }
 
 /// Consolidation level for citations/references.
+///
+/// Consolidation is GROBID's first tier of reference processing; with the
+/// `openalex` feature, the `openalex` module adds an optional second tier
+/// that fills remaining gaps from OpenAlex.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum CitationConsolidation {
     /// No consolidation (`0`, server default).
