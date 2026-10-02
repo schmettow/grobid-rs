@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use grobid::openalex::{Completer, Error, MatchKind};
-use grobid::Biblio;
+use grobid::{Author, Biblio};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -101,10 +101,8 @@ fn completer(addr: SocketAddr) -> Completer {
     Completer::with_base_url(format!("http://{addr}")).expect("completer")
 }
 
-/// A work shaped like a current OpenAlex response, including the schema
-/// changes that the `openalex` crate's model (0.2.2) predates:
-/// `cited_by_api_url`, `grants` and `type_crossref` are gone, `apc_list` has
-/// no `provenance`, and `is_published` is `null`.
+/// A work shaped like a current OpenAlex response, with the fields
+/// completion uses and plenty of fields it ignores.
 const WORK: &str = r#"{
     "id": "https://openalex.org/W2741809807",
     "doi": "https://doi.org/10.7717/peerj.4375",
@@ -194,9 +192,18 @@ const WORK: &str = r#"{
     "fwci": 10.5
 }"#;
 
-fn search_response(work: &str) -> String {
+/// A wrong candidate with the same title as [`WORK`], but a wrong year and a
+/// wrong first author.
+const WRONG_CANDIDATE: &str = r#"{
+    "id": "https://openalex.org/W2",
+    "title": "The state of OA: a large-scale analysis of the prevalence and impact of Open Access articles",
+    "publication_year": 1990,
+    "authorships": [{"author": {"display_name": "Someone Else"}}]
+}"#;
+
+fn search_response(works: &str) -> String {
     format!(
-        r#"{{"meta": {{"count": 1, "db_response_time_ms": 5, "page": 1, "per_page": 5, "groups_count": null}}, "results": [{work}]}}"#
+        r#"{{"meta": {{"count": 1, "db_response_time_ms": 5, "page": 1, "per_page": 5, "groups_count": null}}, "results": [{works}]}}"#
     )
 }
 
@@ -349,4 +356,138 @@ async fn test_http_error_is_reported() {
         }
         other => panic!("expected an HTTP status error, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn test_rate_limit_is_reported() {
+    let (addr, _) = spawn_mock(|_| MockResponse::status(429, "slow down")).await;
+    let biblio = Biblio {
+        doi: Some("10.7717/peerj.4375".to_string()),
+        ..Biblio::default()
+    };
+
+    match completer(addr).complete(&biblio).await {
+        Err(Error::HttpStatus {
+            status, message, ..
+        }) => {
+            assert_eq!(status, 429);
+            assert_eq!(message, "slow down");
+        }
+        other => panic!("expected an HTTP status error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_search_error_is_reported() {
+    let (addr, _) = spawn_mock(|target| {
+        if target.starts_with("/works/doi:") {
+            MockResponse::status(404, r#"{"error": "not found"}"#)
+        } else {
+            MockResponse::status(503, "unavailable")
+        }
+    })
+    .await;
+    let biblio = Biblio {
+        doi: Some("10.9999/unknown".to_string()),
+        title: Some("A title to search for".to_string()),
+        ..Biblio::default()
+    };
+
+    match completer(addr).complete(&biblio).await {
+        Err(Error::HttpStatus { status, .. }) => assert_eq!(status, 503),
+        other => panic!("expected an HTTP status error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_unparseable_response_is_reported() {
+    let (addr, _) = spawn_mock(|_| MockResponse::ok("not json")).await;
+    let biblio = Biblio {
+        doi: Some("10.7717/peerj.4375".to_string()),
+        ..Biblio::default()
+    };
+
+    match completer(addr).complete(&biblio).await {
+        Err(Error::Parse { .. }) => {}
+        other => panic!("expected a parse error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_minimal_response_is_enough() {
+    let (addr, _) = spawn_mock(|_| MockResponse::ok(r#"{"id": "https://openalex.org/W1"}"#)).await;
+    let biblio = Biblio {
+        doi: Some("10.1000/x".to_string()),
+        title: Some("Some parsed title".to_string()),
+        ..Biblio::default()
+    };
+
+    let completion = completer(addr)
+        .complete(&biblio)
+        .await
+        .expect("tolerant parse")
+        .expect("match");
+    assert_eq!(completion.matched_by, MatchKind::Doi);
+    assert_eq!(completion.openalex_id, "https://openalex.org/W1");
+    // Nothing to fill: the parsed data is kept.
+    assert_eq!(
+        completion.biblio.title.as_deref(),
+        Some("Some parsed title")
+    );
+    assert!(completion.biblio.authors.is_empty());
+}
+
+#[tokio::test]
+async fn test_search_chooses_the_compatible_candidate() {
+    let (addr, _) = spawn_mock(|target| {
+        if target.starts_with("/works/doi:") {
+            MockResponse::status(404, r#"{"error": "not found"}"#)
+        } else {
+            let results = format!("{WRONG_CANDIDATE}, {WORK}");
+            MockResponse::ok(search_response(&results))
+        }
+    })
+    .await;
+    let biblio = Biblio {
+        doi: Some("10.9999/unknown".to_string()),
+        title: Some(
+            "The state of OA: a large-scale analysis of the prevalence and impact of Open Access articles"
+                .to_string(),
+        ),
+        date: Some("2018".to_string()),
+        authors: vec![Author {
+            surname: Some("Piwowar".to_string()),
+            ..Author::default()
+        }],
+        ..Biblio::default()
+    };
+
+    let completion = completer(addr)
+        .complete(&biblio)
+        .await
+        .expect("request")
+        .expect("match");
+
+    // The wrong-year, wrong-author candidate is skipped; the journal proves
+    // that [`WORK`] was chosen.
+    assert_eq!(completion.biblio.journal.as_deref(), Some("PeerJ"));
+    assert_eq!(completion.biblio.volume.as_deref(), Some("6"));
+}
+
+#[tokio::test]
+async fn test_doi_is_percent_encoded_in_the_path() {
+    let (addr, requests) = spawn_mock(|_| MockResponse::ok(WORK)).await;
+    let biblio = Biblio {
+        doi: Some("10.1000/ABC/def".to_string()),
+        ..Biblio::default()
+    };
+
+    completer(addr).complete(&biblio).await.expect("request");
+    let targets = requests.lock().expect("lock");
+    assert_eq!(targets.len(), 1);
+    assert!(
+        targets[0].contains("doi:10.1000%2FABC%2Fdef"),
+        "target: {}",
+        targets[0]
+    );
 }

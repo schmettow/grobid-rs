@@ -13,9 +13,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `openalex` cargo feature: `openalex::Completer` looks a reference up by
   DOI (or, when none was parsed, by title) and fills in missing authors,
   journal, volume, pages, DOI, PubMed ID and URL without overwriting parsed
-  values. The `openalex` crate provides the typed work model; requests are
-  made with async `reqwest` and the crate's known response-schema drift is
-  repaired before deserialization.
+  values. Requests are made with async `reqwest` against a small, tolerant
+  in-house model of the OpenAlex response; no external OpenAlex client is
+  required.
+- The matching heuristics (title normalization, year and author checks,
+  candidate ranking) are pinned by an extensive unit test suite. Known
+  weaknesses are documented as `#[ignore]`d tests that assert the desired
+  behavior and fail today, so the backlog is measurable by the number of
+  ignored tests.
+- `Roadmap.md`: the next steps beyond this release (OpenAlex client choice,
+  CLI examples, Ragrig connector, output adapters).
 - `refs2bibtex`: `--openalex` completes the collected references against
   OpenAlex after parsing; the flag requires building the example with
   `--features openalex`.

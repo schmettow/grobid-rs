@@ -12,14 +12,12 @@ readme = "README.md"
 exclude = ["AGENTS.md"]
 
 [features]
-# Second-tier reference completion against OpenAlex. Adds the `openalex`
-# crate for its typed work model; responses are fetched with the async
-# reqwest client that this crate already depends on.
-openalex = ["dep:openalex", "dep:serde_json"]
+# Second-tier reference completion against OpenAlex. Adds `serde_json` for
+# parsing; the requests reuse the existing async reqwest client.
+openalex = ["dep:serde_json"]
 
 [dependencies]
 biblatex = "0.12"
-openalex = { version = "0.2.2", optional = true }
 reqwest = { version = "0.12", default-features = false, features = [
     "multipart",
     "rustls-tls",

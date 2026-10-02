@@ -154,11 +154,13 @@ was parsed, otherwise by title, and missing fields — authors, journal, volume,
 pages, DOI, PubMed ID, ... — are filled in from the matching work. Existing
 fields are never overwritten, and a search result is accepted only when
 title, publication year and first author are compatible with the parsed
-reference. Lookups require HTTPS access to `api.openalex.org`. They use the
-[`openalex`](https://crates.io/crates/openalex) crate for its typed work
-model; because that crate (0.2.2) predates current OpenAlex API schema
-changes, the requests are made with async `reqwest` and the known schema
-drift is repaired before deserialization.
+reference. Lookups require HTTPS access to `api.openalex.org`; they use the
+async `reqwest` client this crate already depends on, so no external OpenAlex
+client is required. Responses are parsed into a small, deliberately tolerant
+in-house model: unknown, missing and `null` fields are ignored, so unrelated
+OpenAlex schema changes do not break completion. The matching heuristics are
+pinned by an extensive test suite, with known weaknesses documented as
+ignored tests.
 
 Enable the feature in `Cargo.toml`:
 

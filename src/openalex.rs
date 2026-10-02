@@ -10,17 +10,19 @@
 //! Existing fields are never overwritten: completion only fills gaps. A
 //! search result is accepted only when title, publication year and first
 //! author are compatible with the parsed reference, so a lookup that cannot
-//! be verified leaves the reference unchanged.
+//! be verified leaves the reference unchanged. The heuristics behind that are
+//! pinned by an extensive test suite; tests marked `#[ignore]` document their
+//! known weaknesses.
 //!
 //! # Feature
 //!
-//! The module is available with the `openalex` cargo feature, which adds the
-//! [`openalex`](https://crates.io/crates/openalex) crate for its typed `Work`
-//! model. That crate (0.2.2) predates several OpenAlex API schema changes and
-//! its blocking HTTP helpers no longer deserialize current responses; this
-//! module therefore fetches with the async `reqwest` client that is already a
-//! dependency, repairs the known schema drift, and then deserializes into the
-//! crate's model. Lookups go to `https://api.openalex.org` by default and
+//! The module is available with the `openalex` cargo feature. It reuses the
+//! async `reqwest` client that this crate already depends on and adds only
+//! `serde_json`; no external OpenAlex client is required. Responses are
+//! parsed into a small, deliberately tolerant model that covers just the
+//! fields completion uses: unknown fields are ignored, and missing or `null`
+//! fields fall back to defaults, so unrelated OpenAlex schema changes do not
+//! break completion. Lookups go to `https://api.openalex.org` by default and
 //! require HTTPS access to it; [`Completer::with_base_url`] points the
 //! completer at a mirror instead.
 //!
@@ -47,13 +49,9 @@
 //! # }
 //! ```
 
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
-
-use ::openalex::api_entities::common_types::DehydratedSource;
-use ::openalex::api_entities::work::WorkResponse;
-use ::openalex::Work;
 
 use crate::bibtex;
 use crate::tei::{Author, Biblio};
@@ -135,8 +133,7 @@ pub enum Error {
         message: String,
     },
 
-    /// The response body could not be parsed into the `openalex` crate's
-    /// model.
+    /// The response body could not be parsed into the completion model.
     #[error("could not parse OpenAlex response from {url}: {source}")]
     Parse {
         /// The full URL that was requested.
@@ -271,8 +268,8 @@ impl Completer {
             reqwest::StatusCode::NOT_FOUND => return Ok(None),
             _ => return Err(self.status_error(&url, response).await),
         }
-        let value = self.json_body(&url, response).await?;
-        Ok(Some(parse_work(&url, value)?))
+        let body = response.text().await?;
+        Ok(Some(parse_json(&url, &body)?))
     }
 
     /// Search works by title, most cited first.
@@ -290,8 +287,9 @@ impl Completer {
         if !response.status().is_success() {
             return Err(self.status_error(&url, response).await);
         }
-        let value = self.json_body(&url, response).await?;
-        Ok(parse_work_response(&url, value)?.results)
+        let body = response.text().await?;
+        let response: WorkResponse = parse_json(&url, &body)?;
+        Ok(response.results)
     }
 
     /// The `/works` endpoint of the configured base URL.
@@ -313,15 +311,6 @@ impl Completer {
         Ok(request.send().await?)
     }
 
-    /// Read a successful response body and parse it as JSON.
-    async fn json_body(&self, url: &Url, response: reqwest::Response) -> Result<Value, Error> {
-        let text = response.text().await?;
-        serde_json::from_str(&text).map_err(|source| Error::Parse {
-            url: url.to_string(),
-            source,
-        })
-    }
-
     /// Build an error from an unsuccessful response, including the truncated
     /// body as the message.
     async fn status_error(&self, url: &Url, response: reqwest::Response) -> Error {
@@ -341,121 +330,117 @@ impl Default for Completer {
     }
 }
 
-/// Parse a single work, repairing the known schema drift first.
-fn parse_work(url: &Url, mut value: Value) -> Result<Work, Error> {
-    sanitize_work(&mut value);
-    serde_json::from_value(value).map_err(|source| Error::Parse {
+/// The subset of an OpenAlex work that reference completion uses.
+///
+/// The model is deliberately tolerant: unknown fields are ignored, and
+/// missing or `null` fields fall back to defaults (see [`null_default`]), so
+/// that unrelated OpenAlex schema changes do not break completion.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct Work {
+    #[serde(deserialize_with = "null_default")]
+    id: String,
+    title: Option<String>,
+    display_name: Option<String>,
+    doi: Option<String>,
+    #[serde(deserialize_with = "null_default")]
+    publication_year: u32,
+    #[serde(deserialize_with = "null_default")]
+    publication_date: String,
+    #[serde(deserialize_with = "null_default")]
+    authorships: Vec<Authorship>,
+    #[serde(deserialize_with = "null_default")]
+    biblio: WorkBiblio,
+    #[serde(deserialize_with = "null_default")]
+    ids: WorkIds,
+    primary_location: Option<Location>,
+    #[serde(deserialize_with = "null_default")]
+    locations: Vec<Location>,
+    #[serde(deserialize_with = "null_default")]
+    cited_by_count: u32,
+    #[serde(rename = "type", deserialize_with = "null_default")]
+    work_type: String,
+}
+
+/// Bibliographic details (volume, issue, pages) of a work.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct WorkBiblio {
+    volume: Option<String>,
+    issue: Option<String>,
+    first_page: Option<String>,
+    last_page: Option<String>,
+}
+
+/// Identifiers of a work; only the PMID is used.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct WorkIds {
+    pmid: Option<String>,
+}
+
+/// One authorship of a work.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct Authorship {
+    #[serde(deserialize_with = "null_default")]
+    author: AuthorName,
+}
+
+/// The name of an author as OpenAlex provides it.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct AuthorName {
+    #[serde(deserialize_with = "null_default")]
+    display_name: String,
+    orcid: Option<String>,
+}
+
+/// A location (landing page and source) of a work.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct Location {
+    landing_page_url: Option<String>,
+    source: Option<Source>,
+}
+
+/// The source (journal, repository, ...) of a location.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct Source {
+    #[serde(deserialize_with = "null_default")]
+    display_name: String,
+    host_organization_name: Option<String>,
+    #[serde(deserialize_with = "null_default")]
+    issn: Vec<String>,
+    issn_l: Option<String>,
+    #[serde(rename = "type")]
+    source_type: Option<String>,
+}
+
+/// A list of works as returned by the search endpoint.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct WorkResponse {
+    #[serde(deserialize_with = "null_default")]
+    results: Vec<Work>,
+}
+
+/// Deserialize a field that may be missing or `null` as its default value.
+fn null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    T: Default + Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// Parse a response body, reporting the URL for context.
+fn parse_json<T: DeserializeOwned>(url: &Url, body: &str) -> Result<T, Error> {
+    serde_json::from_str(body).map_err(|source| Error::Parse {
         url: url.to_string(),
         source,
     })
-}
-
-/// Parse a work list response, repairing the known schema drift first.
-fn parse_work_response(url: &Url, mut value: Value) -> Result<WorkResponse, Error> {
-    sanitize_work(&mut value);
-    serde_json::from_value(value).map_err(|source| Error::Parse {
-        url: url.to_string(),
-        source,
-    })
-}
-
-/// Repair the schema drift between the current OpenAlex API and the model of
-/// the `openalex` crate (0.2.2), which predates several changes:
-///
-/// * required fields that the API no longer returns (`cited_by_api_url`,
-///   `grants`, `type_crossref`) are inserted with empty values,
-/// * `null` values for required booleans, strings and arrays are replaced by
-///   `false`, `""` and `[]`,
-/// * required objects that are `null` (`cited_by_percentile_year`,
-///   `open_access`) are replaced by their defaults.
-///
-/// Unknown extra fields are ignored during deserialization and need no
-/// repair.
-fn sanitize_work(value: &mut Value) {
-    match value {
-        Value::Object(object) => {
-            // Required arrays, which may be absent or `null`.
-            for (key, default) in [
-                ("grants", json!([])),
-                ("host_organization_lineage", json!([])),
-                ("issn", json!([])),
-                ("institutions", json!([])),
-            ] {
-                if object.get(key).is_none_or(Value::is_null) {
-                    object.insert(key.to_string(), default);
-                }
-            }
-            // Required strings, which may be absent or `null`.
-            for (key, default) in [
-                ("cited_by_api_url", json!("")),
-                ("type_crossref", json!("")),
-                ("provenance", json!("")),
-                ("display_name", json!("")),
-                ("ror", json!("")),
-                ("descriptor_ui", json!("")),
-                ("descriptor_name", json!("")),
-                ("qualifier_ui", json!("")),
-            ] {
-                if object.get(key).is_none_or(Value::is_null) {
-                    object.insert(key.to_string(), default);
-                }
-            }
-            // `deserialize_null_default` accepts `null`, but the field is
-            // still required to be present.
-            object
-                .entry("abstract_inverted_index")
-                .or_insert(Value::Null);
-            for key in [
-                "is_oa",
-                "is_accepted",
-                "is_published",
-                "is_in_doaj",
-                "is_major_topic",
-                "has_fulltext",
-                "is_paratext",
-                "is_retracted",
-                "any_repository_has_fulltext",
-            ] {
-                if object.get(key).is_some_and(Value::is_null) {
-                    object.insert(key.to_string(), Value::Bool(false));
-                }
-            }
-            if object
-                .get("cited_by_percentile_year")
-                .is_some_and(Value::is_null)
-            {
-                object.insert(
-                    "cited_by_percentile_year".to_string(),
-                    json!({ "min": 0, "max": 0 }),
-                );
-            }
-            if object.get("open_access").is_some_and(Value::is_null) {
-                object.insert(
-                    "open_access".to_string(),
-                    json!({
-                        "is_oa": false,
-                        "oa_status": "closed",
-                        "oa_url": null,
-                        "any_repository_has_fulltext": false
-                    }),
-                );
-            }
-            for (key, child) in object.iter_mut() {
-                // The abstract inverted index is a free-form word ->
-                // positions map, not an entity: its keys are not fields and
-                // must not be repaired.
-                if key != "abstract_inverted_index" {
-                    sanitize_work(child);
-                }
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                sanitize_work(item);
-            }
-        }
-        _ => {}
-    }
 }
 
 /// Trim a response body and truncate it to a reasonable length, cutting at a
@@ -656,7 +641,7 @@ fn merge(biblio: &Biblio, work: &Work) -> Biblio {
 
 /// The primary source of a work, falling back to the first location that has
 /// one.
-fn work_source(work: &Work) -> Option<&DehydratedSource> {
+fn work_source(work: &Work) -> Option<&Source> {
     work.primary_location
         .as_ref()
         .and_then(|location| location.source.as_ref())
@@ -675,7 +660,7 @@ fn work_source(work: &Work) -> Option<&DehydratedSource> {
 /// contributes no container at all. Publisher and institution are filled only
 /// for publication-like work types, so a repository host does not turn a
 /// preprint into a `@book` entry.
-fn fill_source_fields(merged: &mut Biblio, work: &Work, source: Option<&DehydratedSource>) {
+fn fill_source_fields(merged: &mut Biblio, work: &Work, source: Option<&Source>) {
     let Some(source) = source else {
         return;
     };
@@ -730,7 +715,7 @@ fn fill_source_fields(merged: &mut Biblio, work: &Work, source: Option<&Dehydrat
 
 /// The first ISSN of a source, preferring the print ISSN list over the
 /// linking ISSN.
-fn source_issn(source: &DehydratedSource) -> Option<&str> {
+fn source_issn(source: &Source) -> Option<&str> {
     source
         .issn
         .iter()
@@ -832,73 +817,45 @@ fn nonempty(value: Option<&str>) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    //! Heuristic tests.
+    //!
+    //! The matching and merging heuristics are the core of completion, so
+    //! they are pinned here exhaustively. `#[ignore]`d tests document known
+    //! weaknesses: they assert the behavior we *want* and fail today. When a
+    //! heuristic improves, remove the `#[ignore]` attribute. The number of
+    //! ignored tests is the known backlog; the number of failing
+    //! (non-ignored) tests must stay zero.
+
     use super::*;
     use serde_json::{json, Value};
 
-    /// A work JSON document with all required fields set; not built with the
-    /// `json!` macro to keep macro recursion shallow.
+    /// A work JSON document with the fields completion uses; not built with
+    /// the `json!` macro to keep macro recursion shallow. Unknown fields are
+    /// included on purpose.
     const BASE_WORK: &str = r#"
     {
-        "abstract_inverted_index": null,
-        "authorships": [],
-        "biblio": {},
-        "cited_by_api_url": "https://api.openalex.org/works?filter=cites:W1",
-        "cited_by_count": 0,
-        "concepts": [],
-        "corresponding_author_ids": [],
-        "corresponding_institution_ids": [],
-        "countries_distinct_count": 0,
-        "counts_by_year": [],
-        "created_date": "2020-01-01",
+        "id": "https://openalex.org/W1",
+        "title": "Example",
         "display_name": null,
         "doi": null,
-        "fulltext_origin": null,
-        "grants": [],
-        "has_fulltext": false,
-        "id": "https://openalex.org/W1",
+        "publication_year": 2020,
+        "publication_date": "2020-01-01",
+        "authorships": [],
+        "biblio": {},
         "ids": {
             "openalex": "https://openalex.org/W1"
         },
-        "indexed_in": [],
-        "institutions_distinct_count": 0,
-        "is_paratext": false,
-        "is_retracted": false,
-        "keywords": [],
-        "language": "en",
-        "license": null,
-        "locations": [],
-        "locations_count": 0,
-        "mesh": [],
-        "ngrams_url": null,
-        "open_access": {
-            "is_oa": false,
-            "oa_status": "closed",
-            "oa_url": null,
-            "any_repository_has_fulltext": false
-        },
         "primary_location": null,
-        "primary_topic": null,
-        "publication_date": "2020-01-01",
-        "publication_year": 2020,
-        "referenced_works": [],
-        "related_works": [],
-        "sustainable_development_goals": [],
-        "title": "Example",
-        "topics": [],
+        "locations": [],
+        "cited_by_count": 0,
         "type": "article",
-        "type_crossref": "journal-article",
-        "updated_date": "2020-01-02",
-        "cited_by_percentile_year": {
-            "min": 0,
-            "max": 0
-        },
-        "fwci": null,
-        "referenced_works_count": 0
+        "abstract_inverted_index": null,
+        "grants": []
     }
     "#;
 
-    /// Build a work from a fixture with all required fields set, merging the
-    /// given overrides on top.
+    /// Build a work from the base fixture, merging the given overrides on
+    /// top.
     fn work_fixture(overrides: Value) -> Work {
         let mut base: Value = serde_json::from_str(BASE_WORK).expect("base fixture is valid JSON");
         {
@@ -914,22 +871,43 @@ mod tests {
     fn source(display_name: &str, source_type: &str, host: &str) -> Value {
         json!({
             "display_name": display_name,
-            "host_organization_lineage": [],
             "host_organization_name": host,
-            "id": "https://openalex.org/S1",
-            "is_in_doaj": false,
-            "is_oa": false,
             "issn": ["1234-5678"],
             "type": source_type
         })
     }
 
     fn authorship(display_name: &str) -> Value {
-        json!({
-            "author_position": "first",
-            "author": { "display_name": display_name },
-            "institutions": []
-        })
+        json!({ "author": { "display_name": display_name } })
+    }
+
+    /// The reference the [`select_match`] tests match against.
+    fn model_biblio() -> Biblio {
+        Biblio {
+            title: Some("The Barc model for continuous variables".to_string()),
+            date: Some("2000".to_string()),
+            authors: vec![Author {
+                surname: Some("Kahle".to_string()),
+                ..Author::default()
+            }],
+            ..Biblio::default()
+        }
+    }
+
+    /// A matching candidate for [`model_biblio`], plus overrides.
+    fn model_candidate(overrides: Value) -> Work {
+        let mut base = json!({
+            "title": "The Barc model for continuous variables",
+            "publication_year": 2000,
+            "authorships": [authorship("Brewster Kahle")]
+        });
+        {
+            let base = base.as_object_mut().expect("candidate is an object");
+            for (key, value) in overrides.as_object().expect("overrides are an object") {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+        work_fixture(base)
     }
 
     #[test]
@@ -944,7 +922,10 @@ mod tests {
 
     #[test]
     fn test_with_base_url_validation() {
-        assert!(Completer::with_base_url("not a url").is_err());
+        assert!(matches!(
+            Completer::with_base_url("not a url"),
+            Err(Error::InvalidBaseUrl { .. })
+        ));
         assert!(matches!(
             Completer::with_base_url("ftp://example.org"),
             Err(Error::UnsupportedScheme { .. })
@@ -958,46 +939,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_repairs_schema_drift() {
-        let mut value: Value = serde_json::from_str(BASE_WORK).expect("base fixture is valid JSON");
-        {
-            let object = value.as_object_mut().expect("fixture is an object");
-            object.remove("cited_by_api_url");
-            object.remove("grants");
-            object.remove("type_crossref");
-            object.insert(
-                "apc_list".to_string(),
-                json!({ "value": 1, "currency": "USD", "value_usd": 1 }),
-            );
-            object.insert(
-                "locations".to_string(),
-                json!([{
-                    "is_oa": true,
-                    "is_published": null,
-                    "source": {
-                        "id": "https://openalex.org/S1",
-                        "display_name": "Example Journal",
-                        "is_in_doaj": false,
-                        "is_oa": false,
-                        "issn": null
-                    }
-                }]),
-            );
-        }
-        sanitize_work(&mut value);
-        let work: Work = serde_json::from_value(value).expect("sanitized work parses");
-
-        assert!(work.grants.is_empty());
-        assert_eq!(work.cited_by_api_url, "");
-        assert_eq!(work.type_crossref, "");
-        assert_eq!(work.apc_list.expect("apc list").provenance, "");
-        assert!(!work.locations[0].is_published);
-        let source = work.locations[0].source.as_ref().expect("source");
-        assert!(source.issn.is_empty());
-        assert!(source.host_organization_lineage.is_empty());
-    }
-
-    #[test]
     fn test_normalize_doi() {
         assert_eq!(normalize_doi(" 10.1/x ").as_deref(), Some("10.1/x"));
         assert_eq!(
@@ -1005,81 +946,179 @@ mod tests {
             Some("10.1/X")
         );
         assert_eq!(
+            normalize_doi("HTTPS://DOI.ORG/10.1/X").as_deref(),
+            Some("10.1/X")
+        );
+        assert_eq!(
             normalize_doi("http://dx.doi.org/10.1/x").as_deref(),
             Some("10.1/x")
         );
         assert_eq!(normalize_doi("doi:10.1/x").as_deref(), Some("10.1/x"));
+        assert_eq!(normalize_doi("10.1/x"), Some("10.1/x".to_string()));
         assert_eq!(normalize_doi("   "), None);
     }
 
     #[test]
-    fn test_titles_match() {
-        assert!(titles_match("The Barc model", "the barc model!"));
+    fn test_normalize_title() {
+        assert_eq!(normalize_title("  Hello,   World! "), "hello world");
+        assert_eq!(
+            normalize_title("C++ & Rust: a comparison"),
+            "c rust a comparison"
+        );
+        assert_eq!(normalize_title("ÄÖÜ"), "äöü");
+        assert_eq!(normalize_title("!!!"), "");
+        assert_eq!(normalize_title(""), "");
+    }
+
+    #[test]
+    fn test_titles_match_equal_variants() {
+        for (parsed, candidate) in [
+            ("The Barc model", "the barc model"),
+            ("Deep Learning!", "deep learning"),
+            ("A  study\t of\n things", "a study of things"),
+            ("Zürich", "zürich"),
+            ("C++: a language", "c a language"),
+        ] {
+            assert!(
+                titles_match(parsed, candidate),
+                "{parsed:?} should match {candidate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_titles_match_containment() {
+        // Subtitles on either side.
         assert!(titles_match(
             "The Barc model for continuous variables: a tutorial",
             "The Barc model for continuous variables"
         ));
-        assert!(!titles_match("The Barc model", "A different paper"));
-        // Shorter than the containment threshold.
-        assert!(!titles_match(
-            "Deep learning",
-            "Deep learning for everything"
+        assert!(titles_match(
+            "The Barc model for continuous variables",
+            "The Barc model for continuous variables: a tutorial"
         ));
     }
 
     #[test]
-    fn test_year_and_author_compatibility() {
-        let biblio = Biblio {
-            date: Some("2000".to_string()),
-            authors: vec![Author {
-                surname: Some("Kahle".to_string()),
-                ..Author::default()
-            }],
-            ..Biblio::default()
-        };
-        let same = work_fixture(json!({
-            "publication_year": 2000,
-            "authorships": [authorship("Brewster Kahle")]
-        }));
-        assert!(year_compatible(&biblio, &same));
-        assert!(authors_compatible(&biblio, &same));
-
-        // A one-year difference (online first vs issue) is tolerated.
-        let close = work_fixture(json!({ "publication_year": 2001 }));
-        assert!(year_compatible(&biblio, &close));
-
-        let wrong_year = work_fixture(json!({ "publication_year": 1980 }));
-        assert!(!year_compatible(&biblio, &wrong_year));
-
-        // Name particles are ignored by comparing the last words.
-        let particles = Biblio {
-            authors: vec![Author {
-                surname: Some("van der Berg".to_string()),
-                ..Author::default()
-            }],
-            ..Biblio::default()
-        };
-        let particle = work_fixture(json!({
-            "authorships": [authorship("Cornelis van der Berg")]
-        }));
-        assert!(authors_compatible(&particles, &particle));
-
-        // A different person is not compatible.
-        assert!(!authors_compatible(&biblio, &particle));
-
-        // Unknown names on either side are compatible.
-        let unknown = work_fixture(json!({ "authorships": [authorship("")] }));
-        assert!(authors_compatible(&Biblio::default(), &unknown));
-        assert!(year_compatible(&Biblio::default(), &wrong_year));
+    fn test_titles_match_rejects_different_titles() {
+        for (parsed, candidate) in [
+            ("The Barc model", "A different paper"),
+            ("A study of things", "A study of other things"),
+            ("The Barc model", ""),
+            ("", "The Barc model"),
+            // A short title is not matched by containment even when it is a
+            // prefix of the other title.
+            ("Deep learning", "Deep learning for everything"),
+        ] {
+            assert!(
+                !titles_match(parsed, candidate),
+                "{parsed:?} should not match {candidate:?}"
+            );
+        }
     }
 
     #[test]
-    fn test_work_authors_splits_display_names() {
+    fn test_year_compatible() {
+        let biblio = |date: &str| Biblio {
+            date: Some(date.to_string()),
+            ..Biblio::default()
+        };
+        let work = |year: u32| work_fixture(json!({ "publication_year": year }));
+
+        assert!(year_compatible(&biblio("2019"), &work(2019)));
+        assert!(year_compatible(&biblio("2019-03-01"), &work(2019)));
+        // Online-first vs issue year.
+        assert!(year_compatible(&biblio("2019"), &work(2018)));
+        assert!(year_compatible(&biblio("2019"), &work(2020)));
+        assert!(!year_compatible(&biblio("2019"), &work(2017)));
+        assert!(!year_compatible(&biblio("2019"), &work(2021)));
+        // Unknown years are compatible.
+        assert!(year_compatible(&Biblio::default(), &work(1999)));
+        assert!(year_compatible(&biblio("2019"), &work(0)));
+        // A non-year date counts as unknown.
+        assert!(year_compatible(&biblio("in press"), &work(1999)));
+    }
+
+    #[test]
+    fn test_authors_compatible() {
+        let parsed = |surname: &str| Biblio {
+            authors: vec![Author {
+                surname: Some(surname.to_string()),
+                ..Author::default()
+            }],
+            ..Biblio::default()
+        };
+        let work = |name: &str| work_fixture(json!({ "authorships": [authorship(name)] }));
+
+        assert!(authors_compatible(
+            &parsed("Kahle"),
+            &work("Brewster Kahle")
+        ));
+        assert!(authors_compatible(
+            &parsed("van der Berg"),
+            &work("Cornelis van der Berg")
+        ));
+        assert!(authors_compatible(&parsed("Kahle"), &work("B. Kahle")));
+        assert!(!authors_compatible(
+            &parsed("Kahle"),
+            &work("Brewster Priem")
+        ));
+        // Unknown on either side: no check.
+        assert!(authors_compatible(&Biblio::default(), &work("Anyone Else")));
+        assert!(authors_compatible(&parsed("Kahle"), &work("")));
+        assert!(authors_compatible(
+            &parsed("Kahle"),
+            &work_fixture(json!({ "authorships": [] }))
+        ));
+        // A full name without a surname is used as-is.
+        let full_name = Biblio {
+            authors: vec![Author {
+                full_name: Some("Brewster Kahle".to_string()),
+                ..Author::default()
+            }],
+            ..Biblio::default()
+        };
+        assert!(authors_compatible(&full_name, &work("Brewster Kahle")));
+    }
+
+    #[test]
+    fn test_split_name() {
+        assert_eq!(
+            split_name("Brewster Kahle"),
+            (Some("Brewster".to_string()), Some("Kahle".to_string()))
+        );
+        assert_eq!(
+            split_name("Aristotle"),
+            (None, Some("Aristotle".to_string()))
+        );
+        assert_eq!(
+            split_name("Cornelis van der Berg"),
+            (
+                Some("Cornelis van der".to_string()),
+                Some("Berg".to_string())
+            )
+        );
+        assert_eq!(
+            split_name("Brewster   Kahle"),
+            (Some("Brewster".to_string()), Some("Kahle".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_work_authors() {
         let work = work_fixture(json!({
             "authorships": [
                 authorship("Brewster Kahle"),
-                authorship("Cornelis van der Berg"),
-                authorship("Aristotle")
+                {
+                    "author": {
+                        "display_name": "Cornelis van der Berg",
+                        "orcid": "https://orcid.org/0000-0001-2345-6789"
+                    }
+                },
+                authorship("Aristotle"),
+                // Blank names are skipped.
+                { "author": { "display_name": "   " } },
+                { "author": null }
             ]
         }));
         let authors = work_authors(&work);
@@ -1089,8 +1128,158 @@ mod tests {
         assert_eq!(authors[0].full_name.as_deref(), Some("Brewster Kahle"));
         assert_eq!(authors[1].given_name.as_deref(), Some("Cornelis van der"));
         assert_eq!(authors[1].surname.as_deref(), Some("Berg"));
+        assert_eq!(
+            authors[1].orcid.as_deref(),
+            Some("https://orcid.org/0000-0001-2345-6789")
+        );
         assert_eq!(authors[2].given_name, None);
         assert_eq!(authors[2].surname.as_deref(), Some("Aristotle"));
+    }
+
+    #[test]
+    fn test_select_match_filters_incompatible_candidates() {
+        let biblio = model_biblio();
+
+        let wrong_title = model_candidate(json!({ "title": "A different paper entirely" }));
+        assert!(select_match(&biblio, vec![wrong_title]).is_none());
+
+        let wrong_year = model_candidate(json!({ "publication_year": 1980 }));
+        assert!(select_match(&biblio, vec![wrong_year]).is_none());
+
+        let wrong_author = model_candidate(json!({ "authorships": [authorship("Someone Else")] }));
+        assert!(select_match(&biblio, vec![wrong_author]).is_none());
+
+        // Untitled candidates are skipped.
+        let untitled = model_candidate(json!({ "title": null, "display_name": null }));
+        assert!(select_match(&biblio, vec![untitled]).is_none());
+
+        // No candidates at all.
+        assert!(select_match(&biblio, vec![]).is_none());
+
+        // A reference without a title cannot be matched at all.
+        assert!(select_match(&Biblio::default(), vec![model_candidate(json!({}))]).is_none());
+
+        // Incompatible candidates are skipped; a compatible one is taken.
+        let wrong = model_candidate(json!({ "title": "A different paper entirely" }));
+        let right = model_candidate(json!({}));
+        let selected = select_match(&biblio, vec![wrong, right]).expect("second candidate matches");
+        assert_eq!(
+            selected.title.as_deref(),
+            Some("The Barc model for continuous variables")
+        );
+    }
+
+    #[test]
+    fn test_select_match_prefers_exact_title_over_containment() {
+        let containment = model_candidate(json!({
+            "title": "The Barc model for continuous variables and their applications",
+            "cited_by_count": 10_000
+        }));
+        let exact = model_candidate(json!({ "cited_by_count": 1 }));
+
+        let selected = select_match(&model_biblio(), vec![containment, exact]).expect("match");
+        assert_eq!(
+            selected.title.as_deref(),
+            Some("The Barc model for continuous variables")
+        );
+    }
+
+    #[test]
+    fn test_select_match_prefers_exact_year_then_citations() {
+        let off_by_one = model_candidate(json!({
+            "publication_year": 2001,
+            "cited_by_count": 9999
+        }));
+        let exact = model_candidate(json!({
+            "publication_year": 2000,
+            "cited_by_count": 1
+        }));
+        let selected =
+            select_match(&model_biblio(), vec![off_by_one, exact]).expect("exact year wins");
+        assert_eq!(selected.publication_year, 2000);
+
+        // Otherwise the most cited work wins (typically the canonical record).
+        let rarely_cited = model_candidate(json!({ "cited_by_count": 1 }));
+        let canonical = model_candidate(json!({ "cited_by_count": 100 }));
+        let selected = select_match(&model_biblio(), vec![rarely_cited, canonical]).expect("match");
+        assert_eq!(selected.cited_by_count, 100);
+    }
+
+    #[test]
+    fn test_work_pages() {
+        let work = work_fixture(json!({
+            "biblio": { "first_page": "17", "last_page": "27" }
+        }));
+        assert_eq!(work_pages(&work).as_deref(), Some("17-27"));
+        let work = work_fixture(json!({
+            "biblio": { "first_page": "17", "last_page": "17" }
+        }));
+        assert_eq!(work_pages(&work).as_deref(), Some("17"));
+        let work = work_fixture(json!({ "biblio": { "first_page": "17" } }));
+        assert_eq!(work_pages(&work).as_deref(), Some("17"));
+        let work = work_fixture(json!({ "biblio": { "last_page": "27" } }));
+        assert_eq!(work_pages(&work).as_deref(), Some("27"));
+        let work = work_fixture(json!({ "biblio": {} }));
+        assert_eq!(work_pages(&work), None);
+    }
+
+    #[test]
+    fn test_work_date() {
+        let work = work_fixture(json!({
+            "publication_date": "2019-05-01",
+            "publication_year": 2019
+        }));
+        assert_eq!(work_date(&work).as_deref(), Some("2019-05-01"));
+        let work = work_fixture(json!({
+            "publication_date": "",
+            "publication_year": 2019
+        }));
+        assert_eq!(work_date(&work).as_deref(), Some("2019"));
+        let work = work_fixture(json!({
+            "publication_date": null,
+            "publication_year": 0
+        }));
+        assert_eq!(work_date(&work), None);
+    }
+
+    #[test]
+    fn test_work_url_fallbacks() {
+        let work = work_fixture(json!({
+            "primary_location": { "landing_page_url": "https://primary.example" },
+            "locations": [{ "landing_page_url": "https://other.example" }]
+        }));
+        assert_eq!(work_url(&work), Some("https://primary.example"));
+
+        let work = work_fixture(json!({
+            "primary_location": { "landing_page_url": null },
+            "locations": [{ "landing_page_url": "https://other.example" }]
+        }));
+        assert_eq!(work_url(&work), Some("https://other.example"));
+
+        let work = work_fixture(json!({ "primary_location": null, "locations": [] }));
+        assert_eq!(work_url(&work), Some("https://openalex.org/W1"));
+    }
+
+    #[test]
+    fn test_source_issn() {
+        let work = work_fixture(json!({
+            "primary_location": { "source": source("J", "journal", "P") }
+        }));
+        assert_eq!(source_issn(work_source(&work).unwrap()), Some("1234-5678"));
+
+        let work = work_fixture(json!({
+            "primary_location": { "source": {
+                "display_name": "J",
+                "issn": [],
+                "issn_l": "9999-0000"
+            }}
+        }));
+        assert_eq!(source_issn(work_source(&work).unwrap()), Some("9999-0000"));
+
+        let work = work_fixture(json!({
+            "primary_location": { "source": { "display_name": "J", "issn": ["", "  "] } }
+        }));
+        assert_eq!(source_issn(work_source(&work).unwrap()), None);
     }
 
     #[test]
@@ -1100,14 +1289,12 @@ mod tests {
             "doi": "https://doi.org/10.1002/example",
             "publication_date": "2000-03-01",
             "publication_year": 2000,
-            "ids": { "openalex": "https://openalex.org/W1", "pmid": "12345678" },
+            "ids": { "pmid": "12345678" },
             "authorships": [{
-                "author_position": "first",
                 "author": {
                     "display_name": "Brewster Kahle",
                     "orcid": "https://orcid.org/0000-0001-2345-6789"
-                },
-                "institutions": []
+                }
             }],
             "biblio": {
                 "volume": "18",
@@ -1116,7 +1303,6 @@ mod tests {
                 "last_page": "27"
             },
             "primary_location": {
-                "is_oa": false,
                 "landing_page_url": "https://example.org/article",
                 "source": source("Cell Biochemistry and Function", "journal", "Wiley")
             }
@@ -1158,7 +1344,6 @@ mod tests {
             "authorships": [authorship("Brewster Kahle")],
             "biblio": { "volume": "18" },
             "primary_location": {
-                "is_oa": false,
                 "source": source("OpenAlex Journal", "journal", "Wiley")
             }
         }));
@@ -1183,11 +1368,29 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_never_overwrites_other_identifiers() {
+        let work = work_fixture(json!({ "title": "Example", "doi": "10.1/x" }));
+        let biblio = Biblio {
+            pmcid: Some("PMC1".to_string()),
+            arxiv_id: Some("1706.03762".to_string()),
+            pii: Some("S0000-0000(00)00000-0".to_string()),
+            ark: Some("ark:/12345/x".to_string()),
+            istex_id: Some("istex-1".to_string()),
+            ..Biblio::default()
+        };
+        let merged = merge(&biblio, &work);
+        assert_eq!(merged.pmcid.as_deref(), Some("PMC1"));
+        assert_eq!(merged.arxiv_id.as_deref(), Some("1706.03762"));
+        assert_eq!(merged.pii.as_deref(), Some("S0000-0000(00)00000-0"));
+        assert_eq!(merged.ark.as_deref(), Some("ark:/12345/x"));
+        assert_eq!(merged.istex_id.as_deref(), Some("istex-1"));
+    }
+
+    #[test]
     fn test_merge_container_types() {
         let chapter = work_fixture(json!({
             "type": "book-chapter",
             "primary_location": {
-                "is_oa": false,
                 "source": source("Handbook of Examples", "book series", "Springer")
             }
         }));
@@ -1199,7 +1402,6 @@ mod tests {
         let preprint = work_fixture(json!({
             "type": "preprint",
             "primary_location": {
-                "is_oa": true,
                 "source": source("arXiv", "repository", "Cornell University")
             }
         }));
@@ -1212,7 +1414,6 @@ mod tests {
         let report = work_fixture(json!({
             "type": "report",
             "primary_location": {
-                "is_oa": false,
                 "source": source("Reports", "repository", "Some Institute")
             }
         }));
@@ -1221,86 +1422,84 @@ mod tests {
     }
 
     #[test]
-    fn test_select_match_filters_incompatible_candidates() {
-        let biblio = Biblio {
-            title: Some("The Barc model for continuous variables".to_string()),
-            date: Some("2000".to_string()),
-            authors: vec![Author {
-                surname: Some("Kahle".to_string()),
-                ..Author::default()
-            }],
-            ..Biblio::default()
-        };
-        let matching = |overrides: Value| {
-            let mut base = json!({
-                "title": "The Barc model for continuous variables",
-                "publication_year": 2000,
-                "authorships": [authorship("Brewster Kahle")]
-            });
-            {
-                let base = base.as_object_mut().expect("match fixture is an object");
-                for (key, value) in overrides.as_object().expect("overrides are an object") {
-                    base.insert(key.clone(), value.clone());
-                }
-            }
-            work_fixture(base)
-        };
-
-        let wrong_title = matching(json!({ "title": "A different paper entirely" }));
-        assert!(select_match(&biblio, vec![wrong_title]).is_none());
-
-        let wrong_year = matching(json!({ "publication_year": 1980 }));
-        assert!(select_match(&biblio, vec![wrong_year]).is_none());
-
-        let wrong_author = matching(json!({ "authorships": [authorship("Someone Else")] }));
-        assert!(select_match(&biblio, vec![wrong_author]).is_none());
-
-        // Incompatible candidates are skipped; a compatible one is taken.
-        let wrong = matching(json!({ "title": "A different paper entirely" }));
-        let right = matching(json!({}));
-        let selected = select_match(&biblio, vec![wrong, right]).expect("second candidate matches");
-        assert_eq!(
-            selected.title.as_deref(),
-            Some("The Barc model for continuous variables")
-        );
-
-        // Among compatible candidates, the exact year wins over a nearby one.
-        let off_by_one = matching(json!({ "publication_year": 2001, "cited_by_count": 9999 }));
-        let exact = matching(json!({ "publication_year": 2000, "cited_by_count": 1 }));
-        let selected = select_match(&biblio, vec![off_by_one, exact]).expect("match");
-        assert_eq!(selected.publication_year, 2000);
-
-        // And the most cited work wins (typically the canonical record).
-        let rarely_cited = matching(json!({ "cited_by_count": 1 }));
-        let canonical = matching(json!({ "cited_by_count": 100 }));
-        let selected = select_match(&biblio, vec![rarely_cited, canonical]).expect("match");
-        assert_eq!(selected.cited_by_count, 100);
+    fn test_work_parsing_tolerates_schema_drift() {
+        // Shaped like a current OpenAlex response: fields the model does not
+        // use, and fields the API no longer returns, are ignored.
+        let work: Work = serde_json::from_str(
+            r#"{
+                "id": "https://openalex.org/W1",
+                "title": "Example",
+                "type": "article",
+                "awards": [],
+                "is_xpac": false,
+                "cited_by_api_url": null
+            }"#,
+        )
+        .expect("tolerant parse");
+        assert_eq!(work.title.as_deref(), Some("Example"));
+        assert_eq!(work.work_type, "article");
+        assert_eq!(work.publication_year, 0);
+        assert!(work.authorships.is_empty());
     }
 
     #[test]
-    fn test_work_pages() {
-        let work = work_fixture(json!({
-            "biblio": { "first_page": "17", "last_page": "27" }
-        }));
-        assert_eq!(work_pages(&work).as_deref(), Some("17-27"));
-        let work = work_fixture(json!({ "biblio": { "first_page": "17" } }));
-        assert_eq!(work_pages(&work).as_deref(), Some("17"));
-        let work = work_fixture(json!({ "biblio": {} }));
-        assert_eq!(work_pages(&work), None);
+    fn test_work_parsing_tolerates_nulls_and_missing_fields() {
+        let work: Work = serde_json::from_str(
+            r#"{
+                "id": "https://openalex.org/W1",
+                "title": null,
+                "display_name": null,
+                "doi": null,
+                "publication_year": null,
+                "publication_date": null,
+                "authorships": null,
+                "biblio": null,
+                "ids": null,
+                "primary_location": null,
+                "locations": null,
+                "cited_by_count": null,
+                "type": null
+            }"#,
+        )
+        .expect("tolerant parse");
+        assert_eq!(work.id, "https://openalex.org/W1");
+        assert_eq!(work.doi, None);
+        assert_eq!(work.publication_year, 0);
+        assert_eq!(work.publication_date, "");
+        assert!(work.authorships.is_empty());
+        assert!(work.locations.is_empty());
+
+        let work: Work = serde_json::from_str(
+            r#"{
+                "id": "W",
+                "authorships": [
+                    { "author": null },
+                    { "author": { "display_name": null, "orcid": null } }
+                ],
+                "primary_location": { "source": null },
+                "locations": [
+                    { "landing_page_url": null, "source": { "display_name": null, "issn": null } }
+                ]
+            }"#,
+        )
+        .expect("tolerant parse");
+        assert!(work.authorships[0].author.display_name.is_empty());
+        assert_eq!(work.authorships[1].author.orcid, None);
+        assert!(work.locations[0]
+            .source
+            .as_ref()
+            .expect("source")
+            .issn
+            .is_empty());
     }
 
     #[test]
-    fn test_sanitize_leaves_the_abstract_inverted_index_alone() {
-        let mut value: Value = serde_json::from_str(BASE_WORK).expect("base fixture is valid JSON");
-        value.as_object_mut().expect("object").insert(
-            "abstract_inverted_index".to_string(),
-            json!({ "issn": [0], "grants": [1], "a": [2] }),
-        );
-        sanitize_work(&mut value);
-        let work: Work = serde_json::from_value(value).expect("sanitized work parses");
-        assert_eq!(work.abstract_inverted_index.len(), 3);
-        assert_eq!(work.abstract_inverted_index["issn"], vec![0]);
-        assert_eq!(work.abstract_inverted_index["grants"], vec![1]);
+    fn test_work_response_parsing_defaults() {
+        let response: WorkResponse = serde_json::from_str("{}").expect("tolerant parse");
+        assert!(response.results.is_empty());
+        let response: WorkResponse =
+            serde_json::from_str(r#"{ "results": null }"#).expect("tolerant parse");
+        assert!(response.results.is_empty());
     }
 
     #[tokio::test]
@@ -1318,5 +1517,94 @@ mod tests {
         let truncated = truncate_message(long);
         assert!(truncated.ends_with('…'));
         assert!(truncated.len() <= MAX_ERROR_MESSAGE_LEN + '…'.len_utf8());
+    }
+
+    // ------------------------------------------------------------------
+    // Known weaknesses.
+    //
+    // Each test below asserts the behavior we want and fails today; see the
+    // module comment for the workflow. Keeping them `#[ignore]`d makes the
+    // backlog measurable without breaking the build.
+    // ------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "known weakness: titles are not folded to ASCII, so diacritics differ"]
+    fn known_weakness_diacritics_are_not_folded() {
+        assert!(titles_match("Müller model", "Muller model"));
+    }
+
+    #[test]
+    #[ignore = "known weakness: apostrophes split words (Alzheimer's vs Alzheimers)"]
+    fn known_weakness_possessive_apostrophes() {
+        assert!(titles_match("Alzheimer's disease", "Alzheimers disease"));
+    }
+
+    #[test]
+    #[ignore = "known weakness: compounds with and without hyphens are not equal"]
+    fn known_weakness_hyphen_compounds() {
+        assert!(titles_match(
+            "Co-operation and competition",
+            "Cooperation and competition"
+        ));
+    }
+
+    #[test]
+    #[ignore = "known weakness: containment needs 20 characters, so short subtitles are rejected"]
+    fn known_weakness_short_subtitle() {
+        assert!(titles_match("Deep learning: a review", "Deep learning"));
+    }
+
+    #[test]
+    #[ignore = "known weakness: the ±1 year tolerance can bind a re-edition"]
+    fn known_weakness_year_tolerance_binds_neighbouring_edition() {
+        let biblio = Biblio {
+            date: Some("2019".to_string()),
+            ..Biblio::default()
+        };
+        let work = work_fixture(json!({ "publication_year": 2020 }));
+        assert!(!year_compatible(&biblio, &work));
+    }
+
+    #[test]
+    #[ignore = "known weakness: surname-first display names are mis-split"]
+    fn known_weakness_surname_first_names() {
+        let work = work_fixture(json!({ "authorships": [authorship("Xi Jinping")] }));
+        let authors = work_authors(&work);
+        assert_eq!(authors[0].surname.as_deref(), Some("Xi"));
+    }
+
+    #[test]
+    #[ignore = "known weakness: compound surnames lose all but the last word"]
+    fn known_weakness_compound_surnames() {
+        let work = work_fixture(json!({
+            "authorships": [authorship("Gabriel García Márquez")]
+        }));
+        let authors = work_authors(&work);
+        assert_eq!(authors[0].surname.as_deref(), Some("García Márquez"));
+    }
+
+    #[test]
+    #[ignore = "known weakness: 'Surname, Given' display names are not reordered"]
+    fn known_weakness_comma_names() {
+        let work = work_fixture(json!({ "authorships": [authorship("Kahle, Brewster")] }));
+        let authors = work_authors(&work);
+        assert_eq!(authors[0].surname.as_deref(), Some("Kahle"));
+    }
+
+    #[test]
+    #[ignore = "known weakness: title-only matches cannot be verified"]
+    fn known_weakness_unverifiable_title_only_match() {
+        // Without a year and authors on both sides, any same-title work is
+        // accepted, including wrong ones.
+        let biblio = Biblio {
+            title: Some("Editorial".to_string()),
+            ..Biblio::default()
+        };
+        let wrong = work_fixture(json!({
+            "title": "Editorial",
+            "publication_year": 2021,
+            "cited_by_count": 1
+        }));
+        assert!(select_match(&biblio, vec![wrong]).is_none());
     }
 }
