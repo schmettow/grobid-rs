@@ -400,6 +400,67 @@ pub fn unique_path(path: impl Into<PathBuf>) -> PathBuf {
     candidate
 }
 
+/// The first free variant of `path` with a counter appended to the
+/// publication year: `... - 2020 - Title` becomes `... - 2020-1 - Title`,
+/// then `... - 2020-2 - Title`, and so on. Numbering the year keeps the
+/// other parts of the name (authors, title) in place.
+///
+/// `year` must be the year the name was built from (see [`year`]). When it
+/// is `None`, empty, or does not appear as a ` - `-separated part of the
+/// file stem (e.g. the compact style), this falls back to [`unique_path`],
+/// which numbers the end of the stem instead.
+///
+/// ```
+/// use std::path::PathBuf;
+///
+/// use grobid::bibtex;
+///
+/// // Nothing exists at this path, so it is returned unchanged.
+/// assert_eq!(
+///     bibtex::unique_path_with_year("/no/such/file - 2020 - Title.pdf", Some("2020")),
+///     PathBuf::from("/no/such/file - 2020 - Title.pdf")
+/// );
+/// ```
+pub fn unique_path_with_year(path: impl Into<PathBuf>, year: Option<&str>) -> PathBuf {
+    let target = path.into();
+    if !target.exists() {
+        return target;
+    }
+    let Some(year) = year.filter(|year| !year.is_empty()) else {
+        return unique_path(target);
+    };
+    let Some(stem) = target.file_stem().and_then(|stem| stem.to_str()) else {
+        return unique_path(target);
+    };
+    let parts: Vec<&str> = stem.split(" - ").collect();
+    let Some(index) = parts.iter().position(|part| *part == year) else {
+        return unique_path(target);
+    };
+    let mut counter = 1usize;
+    loop {
+        let numbered = parts
+            .iter()
+            .enumerate()
+            .map(|(i, part)| {
+                if i == index {
+                    format!("{year}-{counter}")
+                } else {
+                    (*part).to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" - ");
+        let mut candidate = target.with_file_name(numbered);
+        if let Some(extension) = target.extension() {
+            candidate.set_extension(extension);
+        }
+        if !candidate.exists() {
+            return candidate;
+        }
+        counter += 1;
+    }
+}
+
 /// Insert a `-<suffix>` marker before the file extension.
 fn with_suffix(path: &Path, suffix: usize) -> PathBuf {
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
@@ -1006,5 +1067,47 @@ mod tests {
         std::fs::write(&second, b"pdf").expect("write");
         let third = unique_path(target);
         assert_eq!(third.file_name().unwrap(), "Smith_2020_Title-3.pdf");
+    }
+
+    #[test]
+    fn test_unique_path_with_year() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let base = dir.path().join("Smith, Jones - 2020 - Same title.pdf");
+        // Nothing exists yet: returned unchanged.
+        assert_eq!(unique_path_with_year(base.clone(), Some("2020")), base);
+
+        std::fs::write(&base, b"pdf").expect("write");
+        // Collisions are numbered on the year, keeping the title in place.
+        let first = unique_path_with_year(base.clone(), Some("2020"));
+        assert_eq!(
+            first.file_name().unwrap(),
+            "Smith, Jones - 2020-1 - Same title.pdf"
+        );
+        std::fs::write(&first, b"pdf").expect("write");
+        assert_eq!(
+            unique_path_with_year(base.clone(), Some("2020"))
+                .file_name()
+                .unwrap(),
+            "Smith, Jones - 2020-2 - Same title.pdf"
+        );
+
+        // A stem without the year as its own ` - ` part (compact style)
+        // falls back to numbering the end of the stem.
+        let compact = dir.path().join("Smith_2020_Title.pdf");
+        std::fs::write(&compact, b"pdf").expect("write");
+        assert_eq!(
+            unique_path_with_year(compact, Some("2020"))
+                .file_name()
+                .unwrap(),
+            "Smith_2020_Title-2.pdf"
+        );
+
+        // Without a year, the end of the stem is numbered as well.
+        let undated = dir.path().join("Some title.pdf");
+        std::fs::write(&undated, b"pdf").expect("write");
+        assert_eq!(
+            unique_path_with_year(undated, None).file_name().unwrap(),
+            "Some title-2.pdf"
+        );
     }
 }

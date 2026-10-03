@@ -28,7 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FileStemStyle::Full` selects `Author1, Author2, ... - Year - Full title`
   with punctuation stripped and no title truncation.
 - `bibtex::unique_path()` returns the first free path variant, adding
-  `-2`, `-3`, ... suffixes before the extension on collisions.
+  `-2`, `-3`, ... suffixes before the extension on collisions;
+  `bibtex::unique_path_with_year()` numbers the publication year instead
+  (`... - 2020 - Title` → `... - 2020-1 - Title`), keeping authors and
+  title in place.
 - `openalex::CompleterBuilder` and `Completer::with_timeout()` configure the
   completion tier with per-request timeouts, custom connect timeouts, a
   custom base URL, or a custom HTTP client; `Completer::new()` keeps its
