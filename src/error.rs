@@ -46,6 +46,29 @@ pub enum Error {
         message: String,
     },
 
+    /// The server is reachable but reports that it is not ready
+    /// (`GET /api/isalive` returned `false`).
+    #[error(
+        "GROBID server at {url} is up, but reports that it is not ready \
+         (/api/isalive returned false)"
+    )]
+    ServerNotReady {
+        /// The base URL of the server.
+        url: String,
+    },
+
+    /// No liveness probe got a response from the server.
+    #[error("GROBID server at {url} did not respond in {attempts} attempt(s): {source}")]
+    ServerUnreachable {
+        /// The base URL of the server.
+        url: String,
+        /// Number of probes made.
+        attempts: usize,
+        /// The transport error of the last attempt.
+        #[source]
+        source: reqwest::Error,
+    },
+
     /// The GROBID server kept responding with 503/429 (all processing
     /// threads busy) until the retry budget was exhausted.
     #[error("GROBID server is busy (HTTP 503/429) after {attempts} attempts")]

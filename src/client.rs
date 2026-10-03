@@ -583,6 +583,70 @@ impl GrobidClient {
         }
     }
 
+    /// Wait until the server reports itself ready (`GET /api/isalive`
+    /// returns `true`), probing up to `attempts` times with `delay` between
+    /// probes.  The number of attempts is clamped to at least one.
+    ///
+    /// GROBID can take a while to become ready (e.g. while preloading its
+    /// models), so a batch job should wait here before its first request.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), grobid::Error> {
+    /// use std::time::Duration;
+    ///
+    /// let client = grobid::GrobidClient::new("http://localhost:8070")?;
+    /// client
+    ///     .wait_until_ready(10, Duration::from_secs(3))
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::ServerNotReady`] if the server responds but reports that
+    ///   it is not alive,
+    /// * [`Error::HttpStatus`] if `/api/isalive` answers with an unexpected
+    ///   status code (e.g. because the base URL is wrong),
+    /// * [`Error::ServerUnreachable`] if no probe got a response.
+    pub async fn wait_until_ready(&self, attempts: usize, delay: Duration) -> Result<(), Error> {
+        let attempts = attempts.max(1);
+        // Probe all but the last attempt without reporting: transport errors
+        // are expected while the server is still starting.
+        for _ in 1..attempts {
+            match self.ping().await {
+                Ok(true) => return Ok(()),
+                // A reachable server that denies being alive will not become
+                // ready by probing again; neither will an unexpected status
+                // code (e.g. because the base URL is wrong).
+                Ok(false) => {
+                    return Err(Error::ServerNotReady {
+                        url: self.base_url.to_string(),
+                    });
+                }
+                Err(err @ Error::HttpStatus { .. }) => return Err(err),
+                Err(_) => {}
+            }
+            tokio::time::sleep(delay).await;
+        }
+        // The final probe reports the outcome with its typed error.
+        match self.ping().await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(Error::ServerNotReady {
+                url: self.base_url.to_string(),
+            }),
+            Err(err @ Error::HttpStatus { .. }) => Err(err),
+            Err(Error::Http(source)) => Err(Error::ServerUnreachable {
+                url: self.base_url.to_string(),
+                attempts,
+                source,
+            }),
+            Err(err) => Err(err),
+        }
+    }
+
     /// The version of the running GROBID service (`GET /api/version`).
     ///
     /// # Example

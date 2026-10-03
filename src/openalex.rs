@@ -52,6 +52,8 @@
 //! # }
 //! ```
 
+use std::time::Duration;
+
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
@@ -182,21 +184,42 @@ impl Completer {
     /// and [`Error::UnsupportedScheme`] when it does not use `http` or
     /// `https`.
     pub fn with_base_url(base_url: impl AsRef<str>) -> Result<Self, Error> {
-        let base_url = base_url.as_ref();
-        let parsed = Url::parse(base_url).map_err(|source| Error::InvalidBaseUrl {
-            base_url: base_url.to_string(),
-            source,
-        })?;
-        match parsed.scheme() {
-            "http" | "https" => Ok(Self {
-                base_url: parsed,
-                http: reqwest::Client::new(),
-            }),
-            scheme => Err(Error::UnsupportedScheme {
-                base_url: base_url.to_string(),
-                scheme: scheme.to_string(),
-            }),
-        }
+        Ok(Self {
+            base_url: parse_base_url(base_url.as_ref())?,
+            http: reqwest::Client::new(),
+        })
+    }
+
+    /// Create a completer for the public API with a per-request timeout, so
+    /// that an unreachable OpenAlex host cannot stall a batch for the
+    /// operating system's TCP timeout.
+    ///
+    /// # Errors
+    //
+    /// Returns [`Error::Http`] if the HTTP client cannot be built.
+    pub fn with_timeout(timeout: Duration) -> Result<Self, Error> {
+        Self::builder().timeout(timeout).build()
+    }
+
+    /// Create a builder for a custom base URL, per-request timeouts or a
+    /// custom HTTP client.
+    ///
+    /// ```
+    /// # fn main() -> Result<(), grobid::openalex::Error> {
+    /// use std::time::Duration;
+    ///
+    /// use grobid::openalex::Completer;
+    ///
+    /// let completer = Completer::builder()
+    ///     .base_url("https://api.openalex.org")?
+    ///     .timeout(Duration::from_secs(10))
+    ///     .build()?;
+    /// assert_eq!(completer.base_url(), "https://api.openalex.org/");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn builder() -> CompleterBuilder {
+        CompleterBuilder::default()
     }
 
     /// The base URL requests are sent to.
@@ -329,6 +352,105 @@ impl Completer {
 impl Default for Completer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Builder for [`Completer`], for a custom base URL, per-request timeouts or
+/// a custom HTTP client.
+///
+/// A timeout or connect timeout applies only to the HTTP client the builder
+/// creates itself; when [`http_client`](Self::http_client) is set, that
+/// client is used as given (configure it there).
+#[derive(Debug, Clone)]
+pub struct CompleterBuilder {
+    base_url: Url,
+    http: Option<reqwest::Client>,
+    timeout: Option<Duration>,
+    connect_timeout: Option<Duration>,
+}
+
+impl Default for CompleterBuilder {
+    fn default() -> Self {
+        Self {
+            base_url: Url::parse(DEFAULT_OPENALEX_URL).expect("built-in OpenAlex URL is valid"),
+            http: None,
+            timeout: None,
+            connect_timeout: None,
+        }
+    }
+}
+
+impl CompleterBuilder {
+    /// Point the completer at another OpenAlex-compatible base URL, e.g. a
+    /// mirror or a local test server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidBaseUrl`] when `base_url` is not a valid URL
+    /// and [`Error::UnsupportedScheme`] when it does not use `http` or
+    /// `https`.
+    pub fn base_url(mut self, base_url: impl AsRef<str>) -> Result<Self, Error> {
+        self.base_url = parse_base_url(base_url.as_ref())?;
+        Ok(self)
+    }
+
+    /// Use a custom HTTP client, e.g. with proxies or TLS settings. Timeouts
+    /// set on this builder are ignored for an explicitly provided client.
+    pub fn http_client(mut self, client: reqwest::Client) -> Self {
+        self.http = Some(client);
+        self
+    }
+
+    /// Timeout for a single request, covering connect and response.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Timeout for establishing a connection.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = Some(timeout);
+        self
+    }
+
+    /// Build the completer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Http`] if the HTTP client cannot be built.
+    pub fn build(self) -> Result<Completer, Error> {
+        let http = match self.http {
+            Some(client) => client,
+            None => {
+                let mut builder = reqwest::Client::builder();
+                if let Some(timeout) = self.timeout {
+                    builder = builder.timeout(timeout);
+                }
+                if let Some(connect_timeout) = self.connect_timeout {
+                    builder = builder.connect_timeout(connect_timeout);
+                }
+                builder.build()?
+            }
+        };
+        Ok(Completer {
+            base_url: self.base_url,
+            http,
+        })
+    }
+}
+
+/// Parse and validate an OpenAlex base URL.
+fn parse_base_url(base_url: &str) -> Result<Url, Error> {
+    let parsed = Url::parse(base_url).map_err(|source| Error::InvalidBaseUrl {
+        base_url: base_url.to_string(),
+        source,
+    })?;
+    match parsed.scheme() {
+        "http" | "https" => Ok(parsed),
+        scheme => Err(Error::UnsupportedScheme {
+            base_url: base_url.to_string(),
+            scheme: scheme.to_string(),
+        }),
     }
 }
 
@@ -1652,5 +1774,73 @@ mod tests {
             "cited_by_count": 1
         }));
         assert!(select_match(&biblio, vec![wrong]).is_none());
+    }
+
+    #[test]
+    fn completer_builder_sets_base_url() {
+        let completer = Completer::builder()
+            .base_url("http://localhost:9999")
+            .expect("valid URL")
+            .timeout(Duration::from_secs(3))
+            .connect_timeout(Duration::from_secs(1))
+            .build()
+            .expect("client");
+        assert_eq!(completer.base_url(), "http://localhost:9999/");
+    }
+
+    #[test]
+    fn completer_builder_validates_base_url() {
+        let error = Completer::builder()
+            .base_url("not a url")
+            .expect_err("invalid URL must fail");
+        assert!(matches!(error, Error::InvalidBaseUrl { .. }), "{error:?}");
+
+        let error = Completer::builder()
+            .base_url("ftp://example.org")
+            .expect_err("unsupported scheme must fail");
+        assert!(
+            matches!(error, Error::UnsupportedScheme { .. }),
+            "{error:?}"
+        );
+    }
+
+    /// A server that accepts connections but never responds must not stall
+    /// completion beyond the configured timeout.
+    #[tokio::test]
+    async fn completer_timeout_applies() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        // Accept one connection and hold it open without answering; the
+        // client's configured timeout must fire.
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _stream = stream;
+                std::future::pending::<()>().await;
+            }
+        });
+
+        let completer = Completer::builder()
+            .base_url(format!("http://{addr}"))
+            .expect("valid URL")
+            .timeout(Duration::from_millis(200))
+            .build()
+            .expect("client");
+        let biblio = Biblio {
+            doi: Some("10.1234/example".to_string()),
+            ..Biblio::default()
+        };
+        let started = std::time::Instant::now();
+        let error = completer
+            .complete(&biblio)
+            .await
+            .expect_err("the request must time out");
+        assert!(matches!(error, Error::Http(_)), "{error:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "timeout took {:?}",
+            started.elapsed()
+        );
     }
 }

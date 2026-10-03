@@ -5,6 +5,34 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v0.4.0
+
+### Changed
+
+- Updated `reqwest` to 0.13 (from 0.12) so that downstream applications no
+  longer compile two HTTP stacks beside grobid; the `rustls` feature replaces
+  `rustls-tls`, and urlencoded requests need the `form` feature.
+
+### Added
+
+- `GrobidClient::wait_until_ready()` waits for `/api/isalive` with bounded
+  retries, replacing the hand-rolled probe loops in the examples. Failures
+  are typed: `Error::ServerNotReady` (server denies being alive),
+  `Error::ServerUnreachable` (no probe got a response after N attempts), and
+  the existing `Error::HttpStatus` for a wrong base URL.
+- `bibtex::suggest_file_stem()` / `suggest_file_stem_with()` and
+  `suggest_file_name()` / `suggest_file_name_with()` expose the
+  `Author_Year_Title` file-naming policy (first author, year, up to ten
+  title words) that `pdf2bibtex --rename` uses; `bibtex::FileStemOptions`
+  makes the title-word count and the ASCII/Unicode policy explicit.
+- `bibtex::unique_path()` returns the first free path variant, adding
+  `-2`, `-3`, ... suffixes before the extension on collisions.
+- `openalex::CompleterBuilder` and `Completer::with_timeout()` configure the
+  completion tier with per-request timeouts, custom connect timeouts, a
+  custom base URL, or a custom HTTP client; `Completer::new()` keeps its
+  previous no-timeout behavior.
+- crates.io metadata now points `documentation` at docs.rs.
+
 ## v0.3.0
 
 ### Added

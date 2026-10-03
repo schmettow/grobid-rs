@@ -16,8 +16,8 @@ Revisit the decision when the feature grows beyond a thin completion tier:
 
 - evaluate maintained async clients (`papers-openalex`, `openalex-rs`, forks
   of `openalex`) for coverage, maintenance activity, license, MSRV and
-  dependency weight — in particular whether they force a second `reqwest`
-  major version, which this crate deliberately moved away from;
+  dependency weight — in particular whether they force yet another `reqwest`
+  major version beside the 0.13 this crate uses since v0.4.0;
 - weigh them against the cost of maintaining our own model. Owning the model
   is what makes the current parser tolerant of unknown, missing and `null`
   fields; a third-party model may be stricter and break on API drift;

@@ -152,6 +152,8 @@ With the `openalex` feature, parsed references can be completed against
 [OpenAlex](https://openalex.org/): a reference is looked up by DOI when one
 was parsed, otherwise by title, and missing fields — authors, journal, volume,
 pages, DOI, PubMed ID, ... — are filled in from the matching work. Existing
+requirement): a reference is looked up by DOI when one was parsed, otherwise by
+title, and missing fields are filled in from the matching work. Existing
 fields are never overwritten, and a search result is accepted only when
 title, publication year and first author are compatible with the parsed
 reference. Lookups require HTTPS access to `api.openalex.org`; they use the
@@ -162,7 +164,9 @@ OpenAlex schema changes do not break completion. Titles are sanitized for
 OpenAlex's filter syntax before they are sent as search terms, so punctuation
 such as commas, pipes or wildcards does not break the lookup either. The
 matching heuristics are pinned by an extensive test suite, with known
-weaknesses documented as ignored tests.
+weaknesses documented as ignored tests. `Completer::with_timeout()` (or
+`Completer::builder()`) bounds each lookup, so an unreachable host cannot
+stall a batch.
 
 Enable the feature in `Cargo.toml`:
 
@@ -216,7 +220,9 @@ With `-r`/`--rename`, each PDF is renamed after its metadata has been
 extracted to `Author_Year_<first 10 title words>.pdf`, e.g.
 `Kahle_2000_The_Barc_model_for_continuous_variables.pdf`. Parts GROBID could
 not extract (author, year or title) are dropped, non-ASCII characters are
-removed, and colliding names get a `-2`, `-3`, ... suffix.
+removed, and colliding names get a `-2`, `-3`, ... suffix. The same policy
+is available to library users as `bibtex::suggest_file_name()` and
+`bibtex::unique_path()`.
 
 With `-l`/`--link`, each entry records the path of its PDF in a `file`
 field, so reference managers can open the document; combined with

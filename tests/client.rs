@@ -676,6 +676,74 @@ async fn test_ping_false() {
     assert_all_ok(&results);
 }
 
+#[tokio::test]
+async fn test_wait_until_ready_ok() {
+    let (addr, results) = spawn_mock(move |req| {
+        if req.target == "/api/isalive" {
+            Ok(MockResponse::text(200, "true"))
+        } else {
+            Err(format!("target: {}", req.target))
+        }
+    })
+    .await;
+
+    let client = test_client(addr, 1);
+    client
+        .wait_until_ready(3, Duration::from_millis(1))
+        .await
+        .expect("server is ready");
+    assert_all_ok(&results);
+}
+
+#[tokio::test]
+async fn test_wait_until_ready_unreachable_counts_attempts() {
+    // Bind and release a port so that nothing is listening on it:
+    // connection attempts are refused.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let dead = listener.local_addr().expect("local addr");
+    drop(listener);
+
+    let client = test_client(dead, 1);
+    let error = client
+        .wait_until_ready(2, Duration::from_millis(1))
+        .await
+        .expect_err("unreachable server must fail");
+    match error {
+        Error::ServerUnreachable { attempts, .. } => assert_eq!(attempts, 2),
+        other => panic!("expected ServerUnreachable, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_wait_until_ready_not_alive() {
+    let (addr, results) = spawn_mock(|_| Ok(MockResponse::text(200, "false"))).await;
+    let client = test_client(addr, 1);
+    let error = client
+        .wait_until_ready(3, Duration::from_millis(1))
+        .await
+        .expect_err("a server denying it is alive must fail");
+    assert!(matches!(error, Error::ServerNotReady { .. }), "{error:?}");
+    assert_all_ok(&results);
+}
+
+#[tokio::test]
+async fn test_wait_until_ready_reports_status_error() {
+    // A wrong base URL is not retried: an unexpected status code fails
+    // immediately.
+    let (addr, results) = spawn_mock(|_| Ok(MockResponse::text(404, "nope"))).await;
+    let client = test_client(addr, 1);
+    let error = client
+        .wait_until_ready(5, Duration::from_millis(1))
+        .await
+        .expect_err("unexpected status must fail");
+    assert!(
+        matches!(error, Error::HttpStatus { status: 404, .. }),
+        "{error:?}"
+    );
+    // Only one probe was made.
+    assert_eq!(results.lock().expect("lock").len(), 1);
+}
+
 #[test]
 fn test_base_url_normalization() {
     let client = GrobidClient::new("http://localhost:8070").expect("client");

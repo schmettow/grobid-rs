@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use grobid::bibtex;
-use grobid::{Biblio, Error, GrobidClient, PdfInput, ProcessOptions, RetryPolicy};
+use grobid::{Biblio, GrobidClient, PdfInput, ProcessOptions, RetryPolicy};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
@@ -108,7 +108,10 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             ..RetryPolicy::default()
         })
         .build();
-    wait_for_server(&probe, PROBE_ATTEMPTS, PROBE_RETRY_DELAY).await?;
+    println!("waiting for GROBID at {} ...", probe.base_url());
+    probe
+        .wait_until_ready(PROBE_ATTEMPTS, PROBE_RETRY_DELAY)
+        .await?;
 
     let http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
@@ -209,69 +212,6 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Wait until the GROBID server responds and reports itself alive.
-///
-/// GROBID can take a while to become ready (e.g. while preloading its
-/// models), so the probe is retried for a bounded time. A server that
-/// refuses connections or does not answer within the probe timeout is
-/// reported with a clear error instead of hanging the batch; a server
-/// that responds with an unexpected HTTP status on `/api/isalive` (e.g.
-/// a wrong base URL) fails immediately, since retrying cannot help.
-async fn wait_for_server(
-    client: &GrobidClient,
-    attempts: usize,
-    retry_delay: Duration,
-) -> Result<(), Box<dyn std::error::Error>> {
-    for attempt in 1..=attempts {
-        let remaining = attempts - attempt;
-        match client.ping().await {
-            Ok(true) => return Ok(()),
-            Ok(false) if remaining > 0 => {
-                eprintln!(
-                    "server at {} not alive yet; retrying in {}s ({}/{})",
-                    client.base_url(),
-                    retry_delay.as_secs(),
-                    attempt,
-                    attempts
-                );
-            }
-            Ok(false) => {
-                return Err(format!(
-                    "GROBID server at {} is up, but reports it is not alive",
-                    client.base_url()
-                )
-                .into());
-            }
-            Err(Error::HttpStatus { status, .. }) => {
-                return Err(format!(
-                    "GROBID server at {} answered HTTP {status} on /api/isalive; \
-                     is the server URL correct?",
-                    client.base_url()
-                )
-                .into());
-            }
-            Err(err) if remaining > 0 => {
-                eprintln!(
-                    "server at {} not responding ({err}); retrying in {}s ({}/{})",
-                    client.base_url(),
-                    retry_delay.as_secs(),
-                    attempt,
-                    attempts
-                );
-            }
-            Err(err) => {
-                return Err(format!(
-                    "cannot reach GROBID server at {} after {attempts} attempts: {err}",
-                    client.base_url()
-                )
-                .into());
-            }
-        }
-        tokio::time::sleep(retry_delay).await;
-    }
-    unreachable!("the loop returns on its final attempt")
-}
-
 /// Process a single PDF through GROBID's header service.
 async fn process_pdf(
     client: &GrobidClient,
@@ -348,7 +288,7 @@ fn rename_pdfs(results: &mut [(PathBuf, Biblio)]) {
     let mut renamed = 0usize;
     for index in order {
         let path = results[index].0.clone();
-        let Some(target) = rename_target(&path, &results[index].1) else {
+        let Some(target) = bibtex::suggest_file_name(&path, &results[index].1) else {
             eprintln!(
                 "warn: cannot rename {}: no author, year or title extracted",
                 path.display()
@@ -358,7 +298,7 @@ fn rename_pdfs(results: &mut [(PathBuf, Biblio)]) {
         if target == path {
             continue; // already named as requested
         }
-        let target = first_free(target);
+        let target = bibtex::unique_path(target);
         match std::fs::rename(&path, &target) {
             Ok(()) => {
                 renamed += 1;
@@ -373,73 +313,6 @@ fn rename_pdfs(results: &mut [(PathBuf, Biblio)]) {
         }
     }
     println!("renamed {renamed} of {} PDF(s)", results.len());
-}
-
-/// Build the new file name `Auth_Year_<first 10 title words>` for a
-/// processed PDF, keeping the original file extension. The parts are
-/// filtered to ASCII alphanumerics (non-ASCII letters are dropped, as in
-/// [`bibtex::suggest_key`]); missing parts are omitted. Returns `None` when
-/// neither author, year nor a title word is available.
-fn rename_target(path: &Path, biblio: &Biblio) -> Option<PathBuf> {
-    let author = biblio
-        .authors
-        .first()
-        .and_then(|author| author.surname.as_deref())
-        .map(sanitize)
-        .unwrap_or_default();
-    let year = bibtex::year(biblio).unwrap_or_default();
-    let title = biblio
-        .title
-        .as_deref()
-        .unwrap_or_default()
-        .split_whitespace()
-        .take(10)
-        .map(sanitize)
-        .filter(|word| !word.is_empty())
-        .collect::<Vec<_>>()
-        .join("_");
-    let stem = [author, year, title]
-        .into_iter()
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("_");
-    if stem.is_empty() {
-        return None;
-    }
-    let mut target = path.with_file_name(stem);
-    if let Some(extension) = path.extension() {
-        target.set_extension(extension);
-    }
-    Some(target)
-}
-
-/// The first free variant of `target`, extended with a `-2`, `-3`, ...
-/// suffix on collisions (like [`bibtex::unique_key`], but for files).
-fn first_free(target: PathBuf) -> PathBuf {
-    let mut candidate = target.clone();
-    let mut suffix = 2usize;
-    while candidate.exists() {
-        candidate = with_suffix(&target, suffix);
-        suffix += 1;
-    }
-    candidate
-}
-
-/// Insert a `-<suffix>` marker before the file extension.
-fn with_suffix(path: &Path, suffix: usize) -> PathBuf {
-    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-    match path.extension() {
-        Some(extension) => {
-            path.with_file_name(format!("{stem}-{suffix}.{}", extension.to_string_lossy()))
-        }
-        None => path.with_file_name(format!("{stem}-{suffix}")),
-    }
-}
-
-/// Filter `text` down to ASCII alphanumerics, as [`bibtex::suggest_key`]
-/// does for citation keys.
-fn sanitize(text: &str) -> String {
-    text.chars().filter(char::is_ascii_alphanumeric).collect()
 }
 
 /// Complete the extracted document headers against OpenAlex.
@@ -595,7 +468,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_wait_for_server_unreachable() {
+    async fn test_wait_until_ready_unreachable() {
         // Bind and release a port so that nothing is listening on it:
         // connection attempts are refused.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -613,12 +486,15 @@ mod tests {
                 ..RetryPolicy::default()
             })
             .build();
-        let error = wait_for_server(&client, 2, Duration::from_millis(1))
+        let error = client
+            .wait_until_ready(2, Duration::from_millis(1))
             .await
             .expect_err("unreachable server must yield an error");
         let message = error.to_string();
-        assert!(message.contains("cannot reach GROBID server"), "{message}");
-        assert!(message.contains("after 2 attempts"), "{message}");
+        assert!(
+            message.contains("did not respond in 2 attempt(s)"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -688,7 +564,7 @@ mod tests {
         // Non-ASCII letters are dropped (as in `bibtex::suggest_key`), only
         // the first ten title words are used, and the extension is kept.
         assert_eq!(
-            rename_target(Path::new("dir/paper.pdf"), &biblio),
+            bibtex::suggest_file_name(Path::new("dir/paper.pdf"), &biblio),
             Some(PathBuf::from(
                 "dir/Milaauskien_2003_One_two_three_four_five_six_seven_eight_nine_ten.pdf"
             ))
@@ -705,21 +581,13 @@ mod tests {
             ..Biblio::default()
         };
         assert_eq!(
-            rename_target(Path::new("papers/paper.PDF"), &biblio),
+            bibtex::suggest_file_name(Path::new("papers/paper.PDF"), &biblio),
             Some(PathBuf::from("papers/2020_A_real_title.PDF"))
         );
         // Without any usable metadata the file keeps its name.
         assert_eq!(
-            rename_target(Path::new("papers/paper.pdf"), &Biblio::default()),
+            bibtex::suggest_file_name(Path::new("papers/paper.pdf"), &Biblio::default()),
             None
-        );
-    }
-
-    #[test]
-    fn test_with_suffix() {
-        assert_eq!(
-            with_suffix(Path::new("dir/Smith2020_Title.pdf"), 2),
-            PathBuf::from("dir/Smith2020_Title-2.pdf")
         );
     }
 

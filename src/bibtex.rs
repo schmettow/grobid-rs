@@ -10,7 +10,7 @@
 //! The `pdf2bibtex` and `refs2bibtex` examples use these helpers.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use biblatex::{Chunk, Date, DateValue, Datetime, Entry, EntryType, Person, Spanned};
 
@@ -155,6 +155,207 @@ pub fn unique_key(biblio: &Biblio, used: &mut HashSet<String>) -> String {
             return key;
         }
         suffix += 1;
+    }
+}
+
+/// Number of title words in a file stem by default.
+const DEFAULT_FILE_STEM_TITLE_WORDS: usize = 10;
+
+/// Options for [`suggest_file_stem_with`] and [`suggest_file_name_with`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileStemOptions {
+    /// Maximum number of title words included. `0` omits the title.
+    pub title_words: usize,
+    /// Keep only ASCII alphanumerics, as [`suggest_key`] does (the default),
+    /// or keep all Unicode alphanumerics. Punctuation and path separators
+    /// are dropped either way.
+    pub ascii_only: bool,
+}
+
+impl Default for FileStemOptions {
+    fn default() -> Self {
+        Self {
+            title_words: DEFAULT_FILE_STEM_TITLE_WORDS,
+            ascii_only: true,
+        }
+    }
+}
+
+/// Suggest a file stem `Author_Year_Title` from the first author's surname,
+/// the publication year and up to ten title words, e.g.
+/// `Kahle_2000_The_Barc_model_for_continuous_variables`.
+///
+/// Missing parts are omitted, and words that contain no alphanumeric
+/// character are dropped. Returns `None` when neither author, year nor title
+/// is known. Non-ASCII letters are dropped, as in [`suggest_key`]; use
+/// [`suggest_file_stem_with`] to keep them.
+///
+/// ```
+/// use grobid::{bibtex, Author, Biblio};
+///
+/// let biblio = Biblio {
+///     authors: vec![Author {
+///         surname: Some("Kahle".to_string()),
+///         ..Author::default()
+///     }],
+///     date: Some("2000-03-01".to_string()),
+///     title: Some("The Barc model for continuous variables".to_string()),
+///     ..Biblio::default()
+/// };
+/// assert_eq!(
+///     bibtex::suggest_file_stem(&biblio).as_deref(),
+///     Some("Kahle_2000_The_Barc_model_for_continuous_variables")
+/// );
+/// ```
+pub fn suggest_file_stem(biblio: &Biblio) -> Option<String> {
+    suggest_file_stem_with(biblio, &FileStemOptions::default())
+}
+
+/// Like [`suggest_file_stem`], with explicit [`FileStemOptions`].
+///
+/// ```
+/// use grobid::{
+///     bibtex::{self, FileStemOptions},
+///     Author, Biblio,
+/// };
+///
+/// let biblio = Biblio {
+///     authors: vec![Author {
+///         surname: Some("Milašauskienė".to_string()),
+///         ..Author::default()
+///     }],
+///     date: Some("2003".to_string()),
+///     title: Some("Über die Müdigkeit".to_string()),
+///     ..Biblio::default()
+/// };
+///
+/// // The default drops non-ASCII letters (as `suggest_key` does).
+/// assert_eq!(
+///     bibtex::suggest_file_stem_with(&biblio, &FileStemOptions::default()).as_deref(),
+///     Some("Milaauskien_2003_ber_die_Mdigkeit")
+/// );
+///
+/// // Unicode letters can be kept instead.
+/// let unicode = FileStemOptions {
+///     ascii_only: false,
+///     ..Default::default()
+/// };
+/// assert_eq!(
+///     bibtex::suggest_file_stem_with(&biblio, &unicode).as_deref(),
+///     Some("Milašauskienė_2003_Über_die_Müdigkeit")
+/// );
+/// ```
+pub fn suggest_file_stem_with(biblio: &Biblio, options: &FileStemOptions) -> Option<String> {
+    let author = biblio
+        .authors
+        .first()
+        .and_then(|author| author.surname.as_deref())
+        .map(|surname| sanitize_part(surname, options.ascii_only))
+        .unwrap_or_default();
+    let year = year(biblio).unwrap_or_default();
+    let title = biblio
+        .title
+        .as_deref()
+        .unwrap_or_default()
+        .split_whitespace()
+        .take(options.title_words)
+        .map(|word| sanitize_part(word, options.ascii_only))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+    let stem = [author, year, title]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+    if stem.is_empty() {
+        None
+    } else {
+        Some(stem)
+    }
+}
+
+/// Suggest a file name for `path`: its directory and extension with the
+/// stem from [`suggest_file_stem`]. Returns `None` when no stem can be
+/// suggested, in which case the file should keep its name.
+///
+/// ```
+/// use std::path::{Path, PathBuf};
+///
+/// use grobid::{bibtex, Biblio};
+///
+/// let biblio = Biblio {
+///     date: Some("2020-01-30".to_string()),
+///     title: Some("--- A *real* title".to_string()),
+///     ..Biblio::default()
+/// };
+/// assert_eq!(
+///     bibtex::suggest_file_name(Path::new("papers/paper.PDF"), &biblio),
+///     Some(PathBuf::from("papers/2020_A_real_title.PDF"))
+/// );
+/// ```
+pub fn suggest_file_name(path: impl AsRef<Path>, biblio: &Biblio) -> Option<PathBuf> {
+    suggest_file_name_with(path, biblio, &FileStemOptions::default())
+}
+
+/// Like [`suggest_file_name`], with explicit [`FileStemOptions`].
+pub fn suggest_file_name_with(
+    path: impl AsRef<Path>,
+    biblio: &Biblio,
+    options: &FileStemOptions,
+) -> Option<PathBuf> {
+    let path = path.as_ref();
+    let stem = suggest_file_stem_with(biblio, options)?;
+    let mut target = path.with_file_name(stem);
+    if let Some(extension) = path.extension() {
+        target.set_extension(extension);
+    }
+    Some(target)
+}
+
+/// The first free variant of `path`, extended with a `-2`, `-3`, ... suffix
+/// before the file extension while the path already exists. Use it to turn
+/// several suggestions for the same name into collision-free names.
+///
+/// ```
+/// use std::path::PathBuf;
+///
+/// use grobid::bibtex;
+///
+/// // Nothing exists at this path, so it is returned unchanged.
+/// assert_eq!(
+///     bibtex::unique_path("/no/such/file.pdf"),
+///     PathBuf::from("/no/such/file.pdf")
+/// );
+/// ```
+pub fn unique_path(path: impl Into<PathBuf>) -> PathBuf {
+    let target = path.into();
+    let mut candidate = target.clone();
+    let mut suffix = 2usize;
+    while candidate.exists() {
+        candidate = with_suffix(&target, suffix);
+        suffix += 1;
+    }
+    candidate
+}
+
+/// Insert a `-<suffix>` marker before the file extension.
+fn with_suffix(path: &Path, suffix: usize) -> PathBuf {
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    match path.extension() {
+        Some(extension) => {
+            path.with_file_name(format!("{stem}-{suffix}.{}", extension.to_string_lossy()))
+        }
+        None => path.with_file_name(format!("{stem}-{suffix}")),
+    }
+}
+
+/// Filter a stem part down to alphanumerics (ASCII-only or Unicode).
+fn sanitize_part(text: &str, ascii_only: bool) -> String {
+    if ascii_only {
+        text.chars().filter(char::is_ascii_alphanumeric).collect()
+    } else {
+        text.chars().filter(|c| c.is_alphanumeric()).collect()
     }
 }
 
@@ -581,5 +782,92 @@ mod tests {
         assert_eq!(unique_key(&make("Smith"), &mut used), "Smith2020-2");
         assert_eq!(unique_key(&make("Smith"), &mut used), "Smith2020-3");
         assert_eq!(unique_key(&make("Jones"), &mut used), "Jones2020");
+    }
+
+    #[test]
+    fn test_suggest_file_stem() {
+        // The default keeps only ASCII, exactly like `suggest_key`.
+        let biblio = Biblio {
+            authors: vec![author("Milašauskienė", None)],
+            date: Some("2003".to_string()),
+            title: Some(
+                "One two three four five six seven eight nine ten eleven twelve".to_string(),
+            ),
+            ..Biblio::default()
+        };
+        assert_eq!(
+            suggest_file_stem(&biblio).as_deref(),
+            Some("Milaauskien_2003_One_two_three_four_five_six_seven_eight_nine_ten")
+        );
+
+        // Missing parts are omitted; punctuation-only words are dropped.
+        let biblio = Biblio {
+            date: Some("2020-01-30".to_string()),
+            title: Some("--- A *real* title".to_string()),
+            ..Biblio::default()
+        };
+        assert_eq!(
+            suggest_file_stem(&biblio).as_deref(),
+            Some("2020_A_real_title")
+        );
+        assert_eq!(suggest_file_stem(&Biblio::default()), None);
+    }
+
+    #[test]
+    fn test_suggest_file_stem_options() {
+        let biblio = Biblio {
+            authors: vec![author("Milašauskienė", None)],
+            date: Some("2003".to_string()),
+            title: Some("Über die Müdigkeit".to_string()),
+            ..Biblio::default()
+        };
+        let unicode = FileStemOptions {
+            ascii_only: false,
+            ..FileStemOptions::default()
+        };
+        assert_eq!(
+            suggest_file_stem_with(&biblio, &unicode).as_deref(),
+            Some("Milašauskienė_2003_Über_die_Müdigkeit")
+        );
+        let no_title = FileStemOptions {
+            title_words: 0,
+            ..FileStemOptions::default()
+        };
+        assert_eq!(
+            suggest_file_stem_with(&biblio, &no_title).as_deref(),
+            Some("Milaauskien_2003")
+        );
+    }
+
+    #[test]
+    fn test_suggest_file_name_keeps_directory_and_extension() {
+        let biblio = Biblio {
+            date: Some("2020-01-30".to_string()),
+            title: Some("--- A *real* title".to_string()),
+            ..Biblio::default()
+        };
+        assert_eq!(
+            suggest_file_name(Path::new("papers/paper.PDF"), &biblio),
+            Some(PathBuf::from("papers/2020_A_real_title.PDF"))
+        );
+        assert_eq!(
+            suggest_file_name(Path::new("paper.pdf"), &Biblio::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn test_unique_path() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let target = dir.path().join("Smith_2020_Title.pdf");
+        assert_eq!(unique_path(target.clone()), target);
+
+        std::fs::write(&target, b"pdf").expect("write");
+        let second = unique_path(target.clone());
+        assert_eq!(second.file_name().unwrap(), "Smith_2020_Title-2.pdf");
+
+        std::fs::write(&second, b"pdf").expect("write");
+        let third = unique_path(target);
+        assert_eq!(third.file_name().unwrap(), "Smith_2020_Title-3.pdf");
     }
 }
