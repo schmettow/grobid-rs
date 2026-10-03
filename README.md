@@ -222,7 +222,9 @@ extracted to `Author_Year_<first 10 title words>.pdf`, e.g.
 not extract (author, year or title) are dropped, non-ASCII characters are
 removed, and colliding names get a `-2`, `-3`, ... suffix. The same policy
 is available to library users as `bibtex::suggest_file_name()` and
-`bibtex::unique_path()`.
+`bibtex::unique_path()`; `bibtex::FileStemStyle::Full` selects
+`Author1, Author2, ... - Year - Full title` with punctuation stripped and no
+title truncation.
 
 With `-l`/`--link`, each entry records the path of its PDF in a `file`
 field, so reference managers can open the document; combined with

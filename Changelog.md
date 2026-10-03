@@ -24,7 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `suggest_file_name()` / `suggest_file_name_with()` expose the
   `Author_Year_Title` file-naming policy (first author, year, up to ten
   title words) that `pdf2bibtex --rename` uses; `bibtex::FileStemOptions`
-  makes the title-word count and the ASCII/Unicode policy explicit.
+  makes the title-word count and the ASCII/Unicode policy explicit, and
+  `FileStemStyle::Full` selects `Author1, Author2, ... - Year - Full title`
+  with punctuation stripped and no title truncation.
 - `bibtex::unique_path()` returns the first free path variant, adding
   `-2`, `-3`, ... suffixes before the extension on collisions.
 - `openalex::CompleterBuilder` and `Completer::with_timeout()` configure the

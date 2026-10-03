@@ -161,10 +161,27 @@ pub fn unique_key(biblio: &Biblio, used: &mut HashSet<String>) -> String {
 /// Number of title words in a file stem by default.
 const DEFAULT_FILE_STEM_TITLE_WORDS: usize = 10;
 
+/// How [`suggest_file_stem_with`] and [`suggest_file_name_with`] format
+/// authors, year and title.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FileStemStyle {
+    /// `Author_Year_Title` — the first author's surname, the year and up to
+    /// [`FileStemOptions::title_words`] title words, joined with `_`.
+    #[default]
+    Compact,
+    /// `Author1, Author2, ... - Year - Full title` — all authors, the year
+    /// and the complete title, joined with ` - `; every part is stripped of
+    /// punctuation, and words stay separated by spaces.
+    Full,
+}
+
 /// Options for [`suggest_file_stem_with`] and [`suggest_file_name_with`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileStemOptions {
-    /// Maximum number of title words included. `0` omits the title.
+    /// How the stem is formatted; see [`FileStemStyle`].
+    pub style: FileStemStyle,
+    /// Maximum number of title words in [`FileStemStyle::Compact`]; ignored
+    /// by [`FileStemStyle::Full`]. `0` omits the title.
     pub title_words: usize,
     /// Keep only ASCII alphanumerics, as [`suggest_key`] does (the default),
     /// or keep all Unicode alphanumerics. Punctuation and path separators
@@ -175,6 +192,7 @@ pub struct FileStemOptions {
 impl Default for FileStemOptions {
     fn default() -> Self {
         Self {
+            style: FileStemStyle::default(),
             title_words: DEFAULT_FILE_STEM_TITLE_WORDS,
             ascii_only: true,
         }
@@ -215,7 +233,7 @@ pub fn suggest_file_stem(biblio: &Biblio) -> Option<String> {
 ///
 /// ```
 /// use grobid::{
-///     bibtex::{self, FileStemOptions},
+///     bibtex::{self, FileStemOptions, FileStemStyle},
 ///     Author, Biblio,
 /// };
 ///
@@ -229,23 +247,33 @@ pub fn suggest_file_stem(biblio: &Biblio) -> Option<String> {
 ///     ..Biblio::default()
 /// };
 ///
-/// // The default drops non-ASCII letters (as `suggest_key` does).
+/// // The compact default drops non-ASCII letters (as `suggest_key` does).
 /// assert_eq!(
 ///     bibtex::suggest_file_stem_with(&biblio, &FileStemOptions::default()).as_deref(),
 ///     Some("Milaauskien_2003_ber_die_Mdigkeit")
 /// );
 ///
-/// // Unicode letters can be kept instead.
-/// let unicode = FileStemOptions {
+/// // The full style lists all authors, keeps the whole title and uses
+/// // ` - ` separators; Unicode letters can be kept.
+/// let full = FileStemOptions {
+///     style: FileStemStyle::Full,
 ///     ascii_only: false,
 ///     ..Default::default()
 /// };
 /// assert_eq!(
-///     bibtex::suggest_file_stem_with(&biblio, &unicode).as_deref(),
-///     Some("Milašauskienė_2003_Über_die_Müdigkeit")
+///     bibtex::suggest_file_stem_with(&biblio, &full).as_deref(),
+///     Some("Milašauskienė - 2003 - Über die Müdigkeit")
 /// );
 /// ```
 pub fn suggest_file_stem_with(biblio: &Biblio, options: &FileStemOptions) -> Option<String> {
+    match options.style {
+        FileStemStyle::Compact => compact_file_stem(biblio, options),
+        FileStemStyle::Full => full_file_stem(biblio, options),
+    }
+}
+
+/// The underscore-joined `Author_Year_Title` stem.
+fn compact_file_stem(biblio: &Biblio, options: &FileStemOptions) -> Option<String> {
     let author = biblio
         .authors
         .first()
@@ -268,6 +296,39 @@ pub fn suggest_file_stem_with(biblio: &Biblio, options: &FileStemOptions) -> Opt
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("_");
+    if stem.is_empty() {
+        None
+    } else {
+        Some(stem)
+    }
+}
+
+/// The space-joined `Author1, Author2, ... - Year - Full title` stem.
+fn full_file_stem(biblio: &Biblio, options: &FileStemOptions) -> Option<String> {
+    let authors = biblio
+        .authors
+        .iter()
+        .filter_map(|author| {
+            author
+                .surname
+                .as_deref()
+                .or(author.full_name.as_deref())
+                .map(|name| sanitize_words(name, options.ascii_only))
+                .filter(|name| !name.is_empty())
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let year = year(biblio).unwrap_or_default();
+    let title = biblio
+        .title
+        .as_deref()
+        .map(|title| sanitize_words(title, options.ascii_only))
+        .unwrap_or_default();
+    let stem = [authors, year, title]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" - ");
     if stem.is_empty() {
         None
     } else {
@@ -357,6 +418,16 @@ fn sanitize_part(text: &str, ascii_only: bool) -> String {
     } else {
         text.chars().filter(|c| c.is_alphanumeric()).collect()
     }
+}
+
+/// Strip punctuation from every whitespace-separated word and join them
+/// with single spaces; words without any alphanumeric character disappear.
+fn sanitize_words(text: &str, ascii_only: bool) -> String {
+    text.split_whitespace()
+        .map(|word| sanitize_part(word, ascii_only))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Convert a bibliographic record into a typed BibLaTeX entry.
@@ -837,6 +908,72 @@ mod tests {
             suggest_file_stem_with(&biblio, &no_title).as_deref(),
             Some("Milaauskien_2003")
         );
+    }
+
+    #[test]
+    fn test_suggest_file_stem_full_style() {
+        let biblio = Biblio {
+            authors: vec![
+                author("Kahle", None),
+                author("Smith", Some("Jane")),
+                // Without a surname, the full name is used.
+                Author {
+                    full_name: Some("No Surname".to_string()),
+                    ..Author::default()
+                },
+                author("Milašauskienė", None),
+            ],
+            date: Some("2000-03-01".to_string()),
+            title: Some(
+                "The B.A.R.C. model: for continuous variables — an introduction!".to_string(),
+            ),
+            ..Biblio::default()
+        };
+        // All authors, the full title, punctuation stripped, Unicode kept.
+        let full_unicode = FileStemOptions {
+            style: FileStemStyle::Full,
+            ascii_only: false,
+            ..FileStemOptions::default()
+        };
+        assert_eq!(
+            suggest_file_stem_with(&biblio, &full_unicode).as_deref(),
+            Some(
+                "Kahle, Smith, No Surname, Milašauskienė - 2000 - \
+                 The BARC model for continuous variables an introduction"
+            )
+        );
+        // The ASCII policy drops diacritics, as in `suggest_key`.
+        let full_ascii = FileStemOptions {
+            style: FileStemStyle::Full,
+            ..FileStemOptions::default()
+        };
+        assert_eq!(
+            suggest_file_stem_with(&biblio, &full_ascii).as_deref(),
+            Some(
+                "Kahle, Smith, No Surname, Milaauskien - 2000 - \
+                 The BARC model for continuous variables an introduction"
+            )
+        );
+    }
+
+    #[test]
+    fn test_full_style_omits_missing_parts_and_keeps_long_titles() {
+        let biblio = Biblio {
+            date: Some("2020".to_string()),
+            // Eleven words: the full style must not truncate.
+            title: Some("One two three four five six seven eight nine ten eleven".to_string()),
+            ..Biblio::default()
+        };
+        let full = FileStemOptions {
+            style: FileStemStyle::Full,
+            title_words: 3, // ignored by the full style
+            ..FileStemOptions::default()
+        };
+        assert_eq!(
+            suggest_file_stem_with(&biblio, &full).as_deref(),
+            Some("2020 - One two three four five six seven eight nine ten eleven")
+        );
+        assert_eq!(suggest_file_stem_with(&Biblio::default(), &full), None);
     }
 
     #[test]
