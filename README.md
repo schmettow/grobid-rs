@@ -297,10 +297,10 @@ models that improve reference parsing:
 
 ```sh
 # CRF models only
-docker run --rm --init --ulimit core=0 -p 8070:8070 grobid/grobid:0.9.1-crf
+docker run -p 8070:8070 grobid/grobid:0.9.1-crf
 
 # with Deep Learning models (add --gpus all on Linux to use a GPU)
-docker run --rm --init --ulimit core=0 -p 8070:8070 grobid/grobid:0.9.1-full
+docker run -p 8070:8070 grobid/grobid:0.9.1-full
 ```
 
 Once the container is up, `http://localhost:8070/api/isalive` returns `true`
