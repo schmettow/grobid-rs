@@ -234,10 +234,14 @@ field, so reference managers can open the document; combined with
 `-r`/`--rename`, the field points at the renamed file. Paths are recorded
 as passed on the command line, so relative input paths stay relative.
 
-With `-m`/`--merge`, the entries are appended to an existing BibTeX file
-instead of a new one. The file is parsed first, and its citation keys are
-reserved, so a new entry whose suggested key already exists gets a `-2`,
-`-3`, ... suffix. `--merge` and `--output` are mutually exclusive.
+With `-a`/`--append` or `-m`/`--merge`, the entries go into an existing
+BibTeX file instead of a new one. Both parse the file first and reserve
+its citation keys, so a new entry whose suggested key already exists gets
+a `-2`, `-3`, ... suffix. `--append` adds every extracted entry;
+`--merge` skips records that are already there, where a record counts as
+present when its normalized field content, one of its identifiers (DOI,
+PMID, arXiv) or its PDF file name matches an existing entry. `--output`,
+`--append` and `--merge` are mutually exclusive.
 
 With `--openalex` (requires building the example with `--features openalex`),
 each extracted header is completed against OpenAlex before entries are

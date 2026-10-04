@@ -13,13 +13,18 @@
 //! entry is written per document. With `-r`/`--rename`, each PDF is renamed
 //! to `Auth_Year_<first 10 title words>.pdf` once its metadata has been
 //! extracted; with `-l`/`--link`, every entry records the path of its PDF
-//! in a `file` field; with `-m`/`--merge`, the entries are appended to an
-//! existing BibTeX file, which is parsed first so that the generated keys
-//! do not collide with the keys already present. Documents that fail to
-//! process are reported on stderr and skipped. When built with the
-//! `openalex` feature, `--openalex` adds a second completion tier against
-//! OpenAlex: headers are completed before entries are formatted and PDFs
-//! are renamed.
+//! in a `file` field.
+//!
+//! With `-a`/`--append` or `-m`/`--merge`, the entries go into an existing
+//! BibTeX file instead of a new one. Both parse the target first, so that
+//! generated citation keys stay unique. `--append` adds every entry;
+//! `--merge` skips entries that are already in the file, where an entry
+//! counts as present when its normalized field content, one of its
+//! identifiers (DOI, PMID, arXiv) or its PDF file name matches an existing
+//! record. Documents that fail to process are reported on stderr and
+//! skipped. When built with the `openalex` feature, `--openalex` adds a
+//! second completion tier against OpenAlex: headers are completed before
+//! entries are formatted and PDFs are renamed.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -27,6 +32,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+use biblatex::ChunksExt;
 use grobid::bibtex;
 use grobid::{Biblio, GrobidClient, PdfInput, ProcessOptions, RetryPolicy};
 use tokio::sync::Semaphore;
@@ -54,16 +60,20 @@ Arguments:
 
 Options:
   -o, --output <FILE>   output .bib file [default: <DIR>.bib, next to <DIR>]
-  -m, --merge <FILE>    append entries to an existing .bib file; the file
-                        is parsed first to avoid key collisions; mutually
-                        exclusive with --output
+  -a, --append <FILE>   append all entries to an existing .bib file; the
+                        file is parsed first to keep the new keys unique
+  -m, --merge <FILE>    like --append, but skip entries whose content,
+                        identifier (DOI, PMID, arXiv) or PDF file name
+                        already occurs in the file
   -s, --server <URL>    GROBID server URL [default: http://localhost:8070]
   -w, --workers <N>     number of concurrent requests [default: 4]
   -r, --rename          rename each PDF to Auth_Year_<first 10 title words>
   -l, --link            add the PDF path as a file field to each entry
       --openalex        complete headers against OpenAlex; requires
                         building with --features openalex
-  -h, --help            print this help";
+  -h, --help            print this help
+
+Only one of --output, --append and --merge may be given.";
 
 struct Args {
     input_dir: PathBuf,
@@ -76,13 +86,17 @@ struct Args {
 }
 
 /// Where the formatted entries are written: a new (or overwritten) output
-/// file, or an existing BibTeX file that they are appended to.
+/// file, or an existing BibTeX file that they are added to.
 enum Destination {
     /// `-o`/`--output`: write all entries to this file.
     Output(PathBuf),
-    /// `-m`/`--merge`: append the entries to this existing BibTeX file. Its
+    /// `-a`/`--append`: append all entries to this existing BibTeX file. Its
     /// keys are parsed before processing, so that no generated key collides
     /// with an entry already in the file.
+    Append(PathBuf),
+    /// `-m`/`--merge`: append only the entries that are not already in this
+    /// existing BibTeX file, judged by normalized field content, identifier
+    /// (DOI, PMID, arXiv) or PDF file name.
     Merge(PathBuf),
 }
 
@@ -106,12 +120,30 @@ async fn main() -> ExitCode {
 }
 
 async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    // With `--merge`, parse the target file first: no PDF must be processed
-    // (or renamed) when its keys cannot be determined, and the keys seed the
-    // collision-free key assignment below.
-    let reserved = match &args.destination {
-        Destination::Merge(path) => parse_existing_keys(path)?,
-        Destination::Output(_) => HashSet::new(),
+    // With `--append` and `--merge`, parse the target file first: no PDF
+    // must be processed (or renamed) when its keys cannot be determined,
+    // and the keys seed the collision-free key assignment below. `--merge`
+    // additionally builds the duplicate index from the existing records.
+    let (reserved, mut seen) = match &args.destination {
+        Destination::Append(path) => {
+            let (keys, _) = load_existing(path)?;
+            println!(
+                "appending to {} ({})",
+                path.display(),
+                entry_count(keys.len())
+            );
+            (keys, MergeIndex::default())
+        }
+        Destination::Merge(path) => {
+            let (keys, index) = load_existing(path)?;
+            println!(
+                "merging into {} ({})",
+                path.display(),
+                entry_count(keys.len())
+            );
+            (keys, index)
+        }
+        Destination::Output(_) => (HashSet::new(), MergeIndex::default()),
     };
 
     let pdfs = collect_pdfs(&args.input_dir)?;
@@ -220,20 +252,27 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Assign deterministic, collision-free keys and format the entries.
-    let entries = format_entries(&results, args.link, &reserved);
+    // With `--merge`, records already present in the target file are left
+    // out.
+    let (entries, duplicates) = match &args.destination {
+        Destination::Merge(_) => merge_entries(&results, args.link, &mut seen, &reserved)?,
+        _ => (format_entries(&results, args.link, &reserved), 0),
+    };
     let bibtex = entries
         .iter()
         .map(|(_, entry)| entry.as_str())
         .collect::<Vec<_>>()
         .join("\n\n");
-    let count = entries.len();
+    let count = entry_count(entries.len());
     match &args.destination {
         Destination::Output(path) => {
             std::fs::write(path, format!("{bibtex}\n"))?;
+            println!("wrote {count} to {} ({} failed)", path.display(), failures);
+        }
+        Destination::Append(path) => {
+            append_entries(path, &bibtex)?;
             println!(
-                "wrote {} entr{} to {} ({} failed)",
-                count,
-                if count == 1 { "y" } else { "ies" },
+                "appended {count} to {} ({} failed)",
                 path.display(),
                 failures
             );
@@ -241,10 +280,9 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         Destination::Merge(path) => {
             append_entries(path, &bibtex)?;
             println!(
-                "added {} entr{} to {} ({} failed)",
-                count,
-                if count == 1 { "y" } else { "ies" },
+                "merged {count} into {} ({} duplicate(s) skipped, {} failed)",
                 path.display(),
+                duplicates,
                 failures
             );
         }
@@ -287,53 +325,323 @@ fn collect_pdfs(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(out)
 }
 
+/// Formatted BibTeX entries together with the path of the PDF they were
+/// extracted from.
+type FormattedEntries = Vec<(PathBuf, String)>;
+
 /// Assign unique BibTeX keys and format all entries, sorted by key. Keys in
-/// `reserved` (e.g. parsed from the file given to `--merge`) are never
-/// reused: on a collision the key is suffixed with `-2`, `-3`, ... With
-/// `link`, each entry records its PDF's path (as it is after renaming) in
-/// a `file` field.
+/// `reserved` (e.g. parsed from the file given to `--append` or `--merge`)
+/// are never reused: on a collision the key is suffixed with `-2`, `-3`,
+/// ... With `link`, each entry records its PDF's path (as it is after
+/// renaming) in a `file` field.
 fn format_entries(
     results: &[(PathBuf, Biblio)],
     link: bool,
     reserved: &HashSet<String>,
-) -> Vec<(PathBuf, String)> {
-    // Sort by suggested key (and path, for determinism) before assigning
-    // collision-free keys.
+) -> FormattedEntries {
+    let mut used = reserved.clone();
+    sorted_entries(results)
+        .into_iter()
+        .map(|(biblio, path, _)| {
+            let key = bibtex::unique_key(biblio, &mut used);
+            (path.clone(), render_entry(&key, biblio, path, link))
+        })
+        .collect()
+}
+
+/// Assign unique keys and format only the records that are not duplicates
+/// of an entry in `seen` (the target file's records plus the ones accepted
+/// from this batch). Returns the new entries and the number of records
+/// skipped as duplicates, in the same order as [`format_entries`].
+fn merge_entries(
+    results: &[(PathBuf, Biblio)],
+    link: bool,
+    seen: &mut MergeIndex,
+    reserved: &HashSet<String>,
+) -> Result<(FormattedEntries, usize), Box<dyn std::error::Error>> {
+    let mut used = reserved.clone();
+    let mut entries = Vec::new();
+    let mut duplicates = 0usize;
+    for (biblio, path, suggested) in sorted_entries(results) {
+        // Identify the record as it would be written; the key is not part
+        // of the identity, so the suggested key can be used provisionally.
+        let rendered = render_entry(&suggested, biblio, path, link);
+        let identity = new_entry_identity(biblio, &rendered, path)?;
+        if seen.contains(&identity) {
+            duplicates += 1;
+            continue;
+        }
+        let key = bibtex::unique_key(biblio, &mut used);
+        entries.push((path.clone(), render_entry(&key, biblio, path, link)));
+        seen.insert(identity);
+    }
+    Ok((entries, duplicates))
+}
+
+/// Records sorted by suggested key (and path, for determinism) before keys
+/// are assigned collision-free.
+fn sorted_entries(results: &[(PathBuf, Biblio)]) -> Vec<(&Biblio, &PathBuf, String)> {
     let mut keyed: Vec<(&Biblio, &PathBuf, String)> = results
         .iter()
         .map(|(path, biblio)| (biblio, path, bibtex::suggest_key(biblio)))
         .collect();
     keyed.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.1.cmp(b.1)));
-
-    let mut used = reserved.clone();
     keyed
-        .into_iter()
-        .map(|(biblio, path, _)| {
-            let key = bibtex::unique_key(biblio, &mut used);
-            let entry = if link {
-                bibtex::format_entry_with_file(&key, biblio, path)
-            } else {
-                bibtex::format_entry(&key, biblio)
-            };
-            (path.clone(), entry)
-        })
-        .collect()
 }
 
-/// Parse the existing BibTeX file at `path` and return the citation keys it
-/// defines, so that merged entries get keys that do not collide with it.
-fn parse_existing_keys(path: &Path) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
+/// Render one record under `key`, adding the PDF path as `file` with
+/// `link`.
+fn render_entry(key: &str, biblio: &Biblio, path: &Path, link: bool) -> String {
+    if link {
+        bibtex::format_entry_with_file(key, biblio, path)
+    } else {
+        bibtex::format_entry(key, biblio)
+    }
+}
+
+/// Parse the existing BibTeX file at `path` and return its citation keys
+/// (for collision-free key assignment) and its duplicate index (for
+/// `--merge`).
+fn load_existing(path: &Path) -> Result<(HashSet<String>, MergeIndex), Box<dyn std::error::Error>> {
     let source = std::fs::read_to_string(path)
         .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
     let bibliography = biblatex::Bibliography::parse(&source)
         .map_err(|err| format!("cannot parse {}: {err}", path.display()))?;
-    println!(
-        "merging into {} ({} existing entr{})",
-        path.display(),
-        bibliography.len(),
-        if bibliography.len() == 1 { "y" } else { "ies" }
-    );
-    Ok(bibliography.keys().map(str::to_string).collect())
+    let keys = bibliography.keys().map(str::to_string).collect();
+    let index = bibliography.iter().map(entry_identity).collect();
+    Ok((keys, index))
+}
+
+/// `1 entry`, `2 entries`, ...
+fn entry_count(count: usize) -> String {
+    format!("{count} entr{}", if count == 1 { "y" } else { "ies" })
+}
+
+/// The identity of a bibliography entry for `--merge`.
+struct EntryIdentity {
+    /// Normalized content of all fields except the citation key.
+    fingerprint: String,
+    /// Normalized identifiers, e.g. `doi:10.1234/x` or `pmid:123`.
+    identifiers: Vec<String>,
+    /// Lowercased PDF file name, from the `file` field or the input path.
+    file_name: Option<String>,
+}
+
+/// The identities of all entries a `--merge` batch compares against: the
+/// records of the target file plus the ones accepted so far.
+#[derive(Default)]
+struct MergeIndex {
+    fingerprints: HashSet<String>,
+    identifiers: HashSet<String>,
+    file_names: HashSet<String>,
+}
+
+impl MergeIndex {
+    /// Whether `identity` matches any known entry.
+    fn contains(&self, identity: &EntryIdentity) -> bool {
+        self.fingerprints.contains(&identity.fingerprint)
+            || identity
+                .identifiers
+                .iter()
+                .any(|identifier| self.identifiers.contains(identifier))
+            || identity
+                .file_name
+                .as_ref()
+                .is_some_and(|name| self.file_names.contains(name))
+    }
+
+    /// Record the identity of an accepted entry.
+    fn insert(&mut self, identity: EntryIdentity) {
+        self.fingerprints.insert(identity.fingerprint);
+        self.identifiers.extend(identity.identifiers);
+        self.file_names.extend(identity.file_name);
+    }
+}
+
+impl FromIterator<EntryIdentity> for MergeIndex {
+    fn from_iter<T: IntoIterator<Item = EntryIdentity>>(iter: T) -> Self {
+        let mut index = Self::default();
+        for identity in iter {
+            index.insert(identity);
+        }
+        index
+    }
+}
+
+/// The identity of an entry parsed from an existing file.
+fn entry_identity(entry: &biblatex::Entry) -> EntryIdentity {
+    EntryIdentity {
+        fingerprint: entry_fingerprint(entry),
+        identifiers: entry_identifiers(entry),
+        file_name: entry_text(entry, "file")
+            .or_else(|| entry_text(entry, "pdf"))
+            .and_then(|file| normalize_file_name(&file)),
+    }
+}
+
+/// The identity of a record about to be written: the rendered entry plus
+/// the identifiers and the file name the renderer does not carry.
+fn new_entry_identity(
+    biblio: &Biblio,
+    rendered: &str,
+    path: &Path,
+) -> Result<EntryIdentity, Box<dyn std::error::Error>> {
+    let bibliography = biblatex::Bibliography::parse(rendered)
+        .map_err(|err| format!("cannot parse rendered entry: {err}"))?;
+    let entry = bibliography
+        .iter()
+        .next()
+        .ok_or_else(|| format!("rendered entry is empty: {rendered}"))?;
+    let mut identity = entry_identity(entry);
+    identity.identifiers.extend(biblio_identifiers(biblio));
+    identity.file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_lowercase());
+    Ok(identity)
+}
+
+/// Normalized content of all fields of an entry, for exact-duplicate
+/// detection. The citation key is not content; field names are already
+/// lowercase, values are lowercased and whitespace-collapsed.
+fn entry_fingerprint(entry: &biblatex::Entry) -> String {
+    let mut fingerprint = format!("{:?}\n", entry.entry_type);
+    for (name, value) in &entry.fields {
+        fingerprint.push_str(name);
+        fingerprint.push('=');
+        fingerprint.push_str(&normalize_text(&value.format_verbatim()));
+        fingerprint.push('\n');
+    }
+    fingerprint
+}
+
+/// Lowercase and collapse whitespace for content comparison.
+fn normalize_text(raw: &str) -> String {
+    raw.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// Normalized identifiers of a parsed entry, as `kind:value` strings. The
+/// fields commonly used for them are all read: `doi`, `pmid`, `pmcid`,
+/// `arxiv` and an `eprint` typed as arXiv.
+fn entry_identifiers(entry: &biblatex::Entry) -> Vec<String> {
+    let mut identifiers = Vec::new();
+    if let Some(doi) = entry_text(entry, "doi").and_then(|raw| normalize_doi(&raw)) {
+        identifiers.push(format!("doi:{doi}"));
+    }
+    if let Some(pmid) = entry_text(entry, "pmid").and_then(|raw| normalize_pmid(&raw)) {
+        identifiers.push(format!("pmid:{pmid}"));
+    }
+    if let Some(pmcid) = entry_text(entry, "pmcid").and_then(|raw| normalize_pmcid(&raw)) {
+        identifiers.push(format!("pmcid:{pmcid}"));
+    }
+    if let Some(arxiv) = entry_arxiv(entry) {
+        identifiers.push(format!("arxiv:{arxiv}"));
+    }
+    identifiers
+}
+
+/// Normalized identifiers of a parsed record. The kinds mirror
+/// [`entry_identifiers`], so that records written later match parsed ones.
+fn biblio_identifiers(biblio: &Biblio) -> Vec<String> {
+    let mut identifiers = Vec::new();
+    if let Some(doi) = biblio.doi.as_deref().and_then(normalize_doi) {
+        identifiers.push(format!("doi:{doi}"));
+    }
+    if let Some(pmid) = biblio.pmid.as_deref().and_then(normalize_pmid) {
+        identifiers.push(format!("pmid:{pmid}"));
+    }
+    if let Some(pmcid) = biblio.pmcid.as_deref().and_then(normalize_pmcid) {
+        identifiers.push(format!("pmcid:{pmcid}"));
+    }
+    if let Some(arxiv) = biblio.arxiv_id.as_deref().and_then(normalize_arxiv) {
+        identifiers.push(format!("arxiv:{arxiv}"));
+    }
+    identifiers
+}
+
+/// The verbatim text of a field of a parsed entry.
+fn entry_text(entry: &biblatex::Entry, field: &str) -> Option<String> {
+    let text = entry.get(field)?.format_verbatim();
+    let trimmed = text.trim();
+    (!trimmed.is_empty()).then_some(trimmed.to_string())
+}
+
+/// The arXiv identifier of an entry: an `arxiv` field, or an `eprint`
+/// field whose `eprinttype`/`archiveprefix` is arXiv.
+fn entry_arxiv(entry: &biblatex::Entry) -> Option<String> {
+    if let Some(arxiv) = entry_text(entry, "arxiv").and_then(|raw| normalize_arxiv(&raw)) {
+        return Some(arxiv);
+    }
+    let kind = entry_text(entry, "eprinttype").or_else(|| entry_text(entry, "archiveprefix"))?;
+    if !kind.eq_ignore_ascii_case("arxiv") {
+        return None;
+    }
+    entry_text(entry, "eprint").and_then(|raw| normalize_arxiv(&raw))
+}
+
+/// Normalize a DOI: strip a resolver or `doi:` prefix, lowercase and trim.
+fn normalize_doi(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let stripped = [
+        "https://doi.org/",
+        "http://doi.org/",
+        "https://dx.doi.org/",
+        "http://dx.doi.org/",
+        "doi:",
+    ]
+    .iter()
+    .find_map(|prefix| lower.strip_prefix(prefix))
+    .unwrap_or(&lower)
+    .trim_end_matches(['.', ',', ';'])
+    .trim();
+    (!stripped.is_empty()).then_some(stripped.to_string())
+}
+
+/// Normalize a PubMed ID: digits only, behind an optional `pmid:` prefix.
+fn normalize_pmid(raw: &str) -> Option<String> {
+    let lower = raw.trim().to_ascii_lowercase();
+    let digits = lower.strip_prefix("pmid:").unwrap_or(&lower).trim();
+    (!digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())).then_some(digits.to_string())
+}
+
+/// Normalize a PubMed Central ID: digits only, behind an optional
+/// `pmcid:`/`pmc:` prefix and an optional `PMC`.
+fn normalize_pmcid(raw: &str) -> Option<String> {
+    let lower = raw.trim().to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("pmcid:")
+        .or_else(|| lower.strip_prefix("pmc:"))
+        .unwrap_or(&lower);
+    let digits = rest.strip_prefix("pmc").unwrap_or(rest).trim();
+    (!digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())).then_some(digits.to_string())
+}
+
+/// Normalize an arXiv identifier: strip an `arxiv:` prefix and a version
+/// suffix, so `2404.14498v2` matches `2404.14498`.
+fn normalize_arxiv(raw: &str) -> Option<String> {
+    let lower = raw.trim().to_ascii_lowercase();
+    let rest = lower.strip_prefix("arxiv:").unwrap_or(&lower).trim();
+    let base = match rest.rsplit_once('v') {
+        Some((base, version))
+            if !base.is_empty()
+                && !version.is_empty()
+                && version.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            base
+        }
+        _ => rest,
+    };
+    (!base.is_empty()).then_some(base.to_string())
+}
+
+/// The lowercased file-name component of a path or of a recorded `file`
+/// field value.
+fn normalize_file_name(raw: &str) -> Option<String> {
+    let name = raw.rsplit(['/', '\\']).next()?.trim();
+    (!name.is_empty()).then_some(name.to_lowercase())
 }
 
 /// Append `bibtex` to the existing file at `path`, keeping one blank line
@@ -461,6 +769,7 @@ async fn complete_headers(
 fn parse_args() -> Result<Option<Args>, String> {
     let mut input_dir: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
+    let mut append: Option<PathBuf> = None;
     let mut merge: Option<PathBuf> = None;
     let mut server_url = grobid::DEFAULT_GROBID_URL.to_string();
     let mut workers = 4usize;
@@ -493,13 +802,15 @@ fn parse_args() -> Result<Option<Args>, String> {
                     openalex = true;
                 }
             }
-            "-o" | "--output" | "-m" | "--merge" | "-s" | "--server" | "-w" | "--workers" => {
+            "-o" | "--output" | "-a" | "--append" | "-m" | "--merge" | "-s" | "--server" | "-w"
+            | "--workers" => {
                 i += 1;
                 let Some(value) = raw.get(i) else {
                     return Err(format!("missing value for {arg}"));
                 };
                 match arg.as_str() {
                     "-o" | "--output" => output = Some(PathBuf::from(value)),
+                    "-a" | "--append" => append = Some(PathBuf::from(value)),
                     "-m" | "--merge" => merge = Some(PathBuf::from(value)),
                     "-s" | "--server" => server_url = value.clone(),
                     "-w" | "--workers" => {
@@ -529,12 +840,13 @@ fn parse_args() -> Result<Option<Args>, String> {
     if workers == 0 {
         return Err("worker count must be at least 1".to_string());
     }
-    let destination = match (output, merge) {
-        (Some(_), Some(_)) => {
-            return Err("--output and --merge are mutually exclusive".to_string());
+    let destination = match (output, append, merge) {
+        (Some(_), Some(_), _) | (Some(_), _, Some(_)) | (_, Some(_), Some(_)) => {
+            return Err("--output, --append and --merge are mutually exclusive".to_string());
         }
-        (_, Some(path)) => Destination::Merge(path),
-        (output, None) => Destination::Output(output.unwrap_or_else(|| {
+        (_, Some(path), None) => Destination::Append(path),
+        (_, None, Some(path)) => Destination::Merge(path),
+        (output, None, None) => Destination::Output(output.unwrap_or_else(|| {
             let name = input_dir
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
@@ -670,9 +982,23 @@ mod tests {
         );
     }
 
+    /// A record for merge and append tests.
+    fn merge_biblio(surname: &str, year: &str, doi: Option<&str>) -> Biblio {
+        Biblio {
+            authors: vec![grobid::Author {
+                surname: Some(surname.to_string()),
+                ..grobid::Author::default()
+            }],
+            date: Some(year.to_string()),
+            title: Some("A title".to_string()),
+            doi: doi.map(str::to_string),
+            ..Biblio::default()
+        }
+    }
+
     #[test]
-    fn test_merge_into_existing_file() {
-        let dir = std::env::temp_dir().join(format!("grobid-merge-{}", std::process::id()));
+    fn test_append_into_existing_file() {
+        let dir = std::env::temp_dir().join(format!("grobid-append-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let path = dir.join("refs.bib");
         // The existing entry ends with a single newline; the appended entry
@@ -680,18 +1006,10 @@ mod tests {
         std::fs::write(&path, "@misc{Smith2019,\n  title = {Existing},\n}\n")
             .expect("write existing bib");
 
-        let reserved = parse_existing_keys(&path).expect("parse existing keys");
+        let (reserved, _) = load_existing(&path).expect("load existing");
         assert_eq!(reserved, HashSet::from(["Smith2019".to_string()]));
 
-        let biblio = Biblio {
-            authors: vec![grobid::Author {
-                surname: Some("Smith".to_string()),
-                ..grobid::Author::default()
-            }],
-            date: Some("2019".to_string()),
-            title: Some("Fresh".to_string()),
-            ..Biblio::default()
-        };
+        let biblio = merge_biblio("Smith", "2019", None);
         let results = vec![(PathBuf::from("a.pdf"), biblio)];
         let entries = format_entries(&results, false, &reserved);
         let bibtex = entries
@@ -701,14 +1019,136 @@ mod tests {
             .join("\n\n");
         append_entries(&path, &bibtex).expect("append entries");
 
-        let merged = std::fs::read_to_string(&path).expect("read merged bib");
-        assert!(merged.starts_with("@misc{Smith2019,"), "{merged}");
-        assert!(merged.contains("}\n\n@misc{Smith2019-2,"), "{merged}");
-        assert!(merged.ends_with("}\n"), "{merged}");
-        // The merged file itself parses back without duplicate keys.
-        let bibliography = biblatex::Bibliography::parse(&merged).expect("parse merged bib");
+        let appended = std::fs::read_to_string(&path).expect("read appended bib");
+        assert!(appended.starts_with("@misc{Smith2019,"), "{appended}");
+        assert!(appended.contains("}\n\n@misc{Smith2019-2,"), "{appended}");
+        assert!(appended.ends_with("}\n"), "{appended}");
+        // The file itself parses back without duplicate keys.
+        let bibliography = biblatex::Bibliography::parse(&appended).expect("parse appended bib");
         assert_eq!(bibliography.len(), 2);
         std::fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn test_merge_skips_exact_duplicate() {
+        let dir = std::env::temp_dir().join(format!("grobid-merge-exact-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("refs.bib");
+        let biblio = merge_biblio("Smith", "2020", None);
+        // A different key must not defeat the content comparison.
+        let rendered = bibtex::format_entry("OldKey2020", &biblio);
+        std::fs::write(&path, format!("{rendered}\n")).expect("write existing bib");
+
+        let (reserved, mut index) = load_existing(&path).expect("load existing");
+        let results = vec![(PathBuf::from("again.pdf"), biblio)];
+        let (entries, duplicates) =
+            merge_entries(&results, false, &mut index, &reserved).expect("merge");
+        assert!(entries.is_empty(), "{entries:?}");
+        assert_eq!(duplicates, 1);
+        std::fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn test_merge_skips_identifier_match() {
+        let dir = std::env::temp_dir().join(format!("grobid-merge-doi-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("refs.bib");
+        let existing = merge_biblio("Smith", "2020", Some("https://doi.org/10.1234/ABC.1"));
+        let rendered = bibtex::format_entry("Smith2020", &existing);
+        std::fs::write(&path, format!("{rendered}\n")).expect("write existing bib");
+
+        let (reserved, mut index) = load_existing(&path).expect("load existing");
+        // A different extraction of the same work: the DOI matches although
+        // title and key differ.
+        let mut fresh = merge_biblio("Smith", "2020", Some("doi:10.1234/abc.1"));
+        fresh.title = Some("Another title".to_string());
+        let results = vec![(PathBuf::from("b.pdf"), fresh)];
+        let (entries, duplicates) =
+            merge_entries(&results, false, &mut index, &reserved).expect("merge");
+        assert!(entries.is_empty(), "{entries:?}");
+        assert_eq!(duplicates, 1);
+        std::fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn test_merge_skips_same_file_name() {
+        let dir = std::env::temp_dir().join(format!("grobid-merge-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("refs.bib");
+        let existing = merge_biblio("Smith", "2019", Some("10.1/old"));
+        let rendered =
+            bibtex::format_entry_with_file("Smith2019", &existing, "papers/deep/paper.pdf");
+        std::fs::write(&path, format!("{rendered}\n")).expect("write existing bib");
+
+        let (reserved, mut index) = load_existing(&path).expect("load existing");
+        // Different metadata and no identifier, but the same PDF file name.
+        let mut fresh = merge_biblio("Jones", "2021", None);
+        fresh.title = Some("Different".to_string());
+        let results = vec![(PathBuf::from("/elsewhere/paper.pdf"), fresh)];
+        let (entries, duplicates) =
+            merge_entries(&results, true, &mut index, &reserved).expect("merge");
+        assert!(entries.is_empty(), "{entries:?}");
+        assert_eq!(duplicates, 1);
+        std::fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn test_merge_adds_new_and_dedupes_batch() {
+        let dir = std::env::temp_dir().join(format!("grobid-merge-batch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("refs.bib");
+        let existing = merge_biblio("Smith", "2019", Some("10.1/old"));
+        let rendered = bibtex::format_entry("Smith2019", &existing);
+        std::fs::write(&path, format!("{rendered}\n")).expect("write existing bib");
+
+        let (reserved, mut index) = load_existing(&path).expect("load existing");
+        let results = vec![
+            // Already in the file.
+            (PathBuf::from("a.pdf"), existing),
+            // New, and once more in the same batch under a different DOI
+            // spelling.
+            (
+                PathBuf::from("b.pdf"),
+                merge_biblio("Jones", "2021", Some("10.1/new")),
+            ),
+            (
+                PathBuf::from("c.pdf"),
+                merge_biblio("Jones", "2021", Some("https://doi.org/10.1/NEW")),
+            ),
+        ];
+        let (entries, duplicates) =
+            merge_entries(&results, false, &mut index, &reserved).expect("merge");
+        assert_eq!(duplicates, 2);
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0].1.starts_with("@misc{Jones2021,"),
+            "{}",
+            entries[0].1
+        );
+        assert!(
+            entries[0].1.contains("doi = {10.1/new}"),
+            "{}",
+            entries[0].1
+        );
+        std::fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn test_normalize_identifiers() {
+        assert_eq!(
+            normalize_doi("https://doi.org/10.1234/ABC.1."),
+            Some("10.1234/abc.1".to_string())
+        );
+        assert_eq!(normalize_pmid("PMID: 12345"), Some("12345".to_string()));
+        assert_eq!(normalize_pmcid("PMC12345"), Some("12345".to_string()));
+        assert_eq!(
+            normalize_arxiv("arXiv:2404.14498v2"),
+            Some("2404.14498".to_string())
+        );
+        assert_eq!(
+            normalize_file_name("papers/deep/Paper.PDF"),
+            Some("paper.pdf".to_string())
+        );
     }
 
     #[test]
@@ -717,7 +1157,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let path = dir.join("refs.bib");
         std::fs::write(&path, "").expect("write empty bib");
-        assert!(parse_existing_keys(&path).expect("parse").is_empty());
+        assert!(load_existing(&path).expect("load").0.is_empty());
         append_entries(&path, "@misc{a,\n}").expect("append to empty file");
         assert_eq!(
             std::fs::read_to_string(&path).expect("read"),
