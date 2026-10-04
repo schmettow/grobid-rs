@@ -13,10 +13,13 @@
 //! entry is written per document. With `-r`/`--rename`, each PDF is renamed
 //! to `Auth_Year_<first 10 title words>.pdf` once its metadata has been
 //! extracted; with `-l`/`--link`, every entry records the path of its PDF
-//! in a `file` field. Documents that fail to process are reported on stderr
-//! and skipped. When built with the `openalex` feature, `--openalex` adds a
-//! second completion tier against OpenAlex: headers are completed before
-//! entries are formatted and PDFs are renamed.
+//! in a `file` field; with `-m`/`--merge`, the entries are appended to an
+//! existing BibTeX file, which is parsed first so that the generated keys
+//! do not collide with the keys already present. Documents that fail to
+//! process are reported on stderr and skipped. When built with the
+//! `openalex` feature, `--openalex` adds a second completion tier against
+//! OpenAlex: headers are completed before entries are formatted and PDFs
+//! are renamed.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -51,6 +54,9 @@ Arguments:
 
 Options:
   -o, --output <FILE>   output .bib file [default: <DIR>.bib, next to <DIR>]
+  -m, --merge <FILE>    append entries to an existing .bib file; the file
+                        is parsed first to avoid key collisions; mutually
+                        exclusive with --output
   -s, --server <URL>    GROBID server URL [default: http://localhost:8070]
   -w, --workers <N>     number of concurrent requests [default: 4]
   -r, --rename          rename each PDF to Auth_Year_<first 10 title words>
@@ -61,12 +67,23 @@ Options:
 
 struct Args {
     input_dir: PathBuf,
-    output: PathBuf,
+    destination: Destination,
     server_url: String,
     workers: usize,
     rename: bool,
     link: bool,
     openalex: bool,
+}
+
+/// Where the formatted entries are written: a new (or overwritten) output
+/// file, or an existing BibTeX file that they are appended to.
+enum Destination {
+    /// `-o`/`--output`: write all entries to this file.
+    Output(PathBuf),
+    /// `-m`/`--merge`: append the entries to this existing BibTeX file. Its
+    /// keys are parsed before processing, so that no generated key collides
+    /// with an entry already in the file.
+    Merge(PathBuf),
 }
 
 #[tokio::main]
@@ -89,6 +106,14 @@ async fn main() -> ExitCode {
 }
 
 async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+    // With `--merge`, parse the target file first: no PDF must be processed
+    // (or renamed) when its keys cannot be determined, and the keys seed the
+    // collision-free key assignment below.
+    let reserved = match &args.destination {
+        Destination::Merge(path) => parse_existing_keys(path)?,
+        Destination::Output(_) => HashSet::new(),
+    };
+
     let pdfs = collect_pdfs(&args.input_dir)?;
     if pdfs.is_empty() {
         return Err(format!("no PDFs found in {}", args.input_dir.display()).into());
@@ -195,20 +220,35 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Assign deterministic, collision-free keys and format the entries.
-    let entries = format_entries(&results, args.link);
+    let entries = format_entries(&results, args.link, &reserved);
     let bibtex = entries
         .iter()
         .map(|(_, entry)| entry.as_str())
         .collect::<Vec<_>>()
         .join("\n\n");
-    std::fs::write(&args.output, format!("{bibtex}\n"))?;
-    println!(
-        "wrote {} entr{} to {} ({} failed)",
-        entries.len(),
-        if entries.len() == 1 { "y" } else { "ies" },
-        args.output.display(),
-        failures
-    );
+    let count = entries.len();
+    match &args.destination {
+        Destination::Output(path) => {
+            std::fs::write(path, format!("{bibtex}\n"))?;
+            println!(
+                "wrote {} entr{} to {} ({} failed)",
+                count,
+                if count == 1 { "y" } else { "ies" },
+                path.display(),
+                failures
+            );
+        }
+        Destination::Merge(path) => {
+            append_entries(path, &bibtex)?;
+            println!(
+                "added {} entr{} to {} ({} failed)",
+                count,
+                if count == 1 { "y" } else { "ies" },
+                path.display(),
+                failures
+            );
+        }
+    }
     Ok(())
 }
 
@@ -247,10 +287,16 @@ fn collect_pdfs(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Assign unique BibTeX keys and format all entries, sorted by key. With
+/// Assign unique BibTeX keys and format all entries, sorted by key. Keys in
+/// `reserved` (e.g. parsed from the file given to `--merge`) are never
+/// reused: on a collision the key is suffixed with `-2`, `-3`, ... With
 /// `link`, each entry records its PDF's path (as it is after renaming) in
 /// a `file` field.
-fn format_entries(results: &[(PathBuf, Biblio)], link: bool) -> Vec<(PathBuf, String)> {
+fn format_entries(
+    results: &[(PathBuf, Biblio)],
+    link: bool,
+    reserved: &HashSet<String>,
+) -> Vec<(PathBuf, String)> {
     // Sort by suggested key (and path, for determinism) before assigning
     // collision-free keys.
     let mut keyed: Vec<(&Biblio, &PathBuf, String)> = results
@@ -259,7 +305,7 @@ fn format_entries(results: &[(PathBuf, Biblio)], link: bool) -> Vec<(PathBuf, St
         .collect();
     keyed.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.1.cmp(b.1)));
 
-    let mut used = HashSet::new();
+    let mut used = reserved.clone();
     keyed
         .into_iter()
         .map(|(biblio, path, _)| {
@@ -272,6 +318,45 @@ fn format_entries(results: &[(PathBuf, Biblio)], link: bool) -> Vec<(PathBuf, St
             (path.clone(), entry)
         })
         .collect()
+}
+
+/// Parse the existing BibTeX file at `path` and return the citation keys it
+/// defines, so that merged entries get keys that do not collide with it.
+fn parse_existing_keys(path: &Path) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
+    let source = std::fs::read_to_string(path)
+        .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+    let bibliography = biblatex::Bibliography::parse(&source)
+        .map_err(|err| format!("cannot parse {}: {err}", path.display()))?;
+    println!(
+        "merging into {} ({} existing entr{})",
+        path.display(),
+        bibliography.len(),
+        if bibliography.len() == 1 { "y" } else { "ies" }
+    );
+    Ok(bibliography.keys().map(str::to_string).collect())
+}
+
+/// Append `bibtex` to the existing file at `path`, keeping one blank line
+/// between the existing entries and the appended ones.
+fn append_entries(path: &Path, bibtex: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let existing = std::fs::read_to_string(path)?;
+    let mut addition = String::new();
+    if !existing.is_empty() {
+        if !existing.ends_with('\n') {
+            addition.push('\n');
+        }
+        if !existing.ends_with("\n\n") {
+            addition.push('\n');
+        }
+    }
+    addition.push_str(bibtex);
+    addition.push('\n');
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)?
+        .write_all(addition.as_bytes())
 }
 
 /// Rename every processed PDF to its [`rename_target`] name, keeping the
@@ -376,6 +461,7 @@ async fn complete_headers(
 fn parse_args() -> Result<Option<Args>, String> {
     let mut input_dir: Option<PathBuf> = None;
     let mut output: Option<PathBuf> = None;
+    let mut merge: Option<PathBuf> = None;
     let mut server_url = grobid::DEFAULT_GROBID_URL.to_string();
     let mut workers = 4usize;
     let mut rename = false;
@@ -407,13 +493,14 @@ fn parse_args() -> Result<Option<Args>, String> {
                     openalex = true;
                 }
             }
-            "-o" | "--output" | "-s" | "--server" | "-w" | "--workers" => {
+            "-o" | "--output" | "-m" | "--merge" | "-s" | "--server" | "-w" | "--workers" => {
                 i += 1;
                 let Some(value) = raw.get(i) else {
                     return Err(format!("missing value for {arg}"));
                 };
                 match arg.as_str() {
                     "-o" | "--output" => output = Some(PathBuf::from(value)),
+                    "-m" | "--merge" => merge = Some(PathBuf::from(value)),
                     "-s" | "--server" => server_url = value.clone(),
                     "-w" | "--workers" => {
                         workers = value
@@ -442,19 +529,25 @@ fn parse_args() -> Result<Option<Args>, String> {
     if workers == 0 {
         return Err("worker count must be at least 1".to_string());
     }
-    let output = output.unwrap_or_else(|| {
-        let name = input_dir
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "output".to_string());
-        input_dir
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(format!("{name}.bib"))
-    });
+    let destination = match (output, merge) {
+        (Some(_), Some(_)) => {
+            return Err("--output and --merge are mutually exclusive".to_string());
+        }
+        (_, Some(path)) => Destination::Merge(path),
+        (output, None) => Destination::Output(output.unwrap_or_else(|| {
+            let name = input_dir
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "output".to_string());
+            input_dir
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(format!("{name}.bib"))
+        })),
+    };
     Ok(Some(Args {
         input_dir,
-        output,
+        destination,
         server_url,
         workers,
         rename,
@@ -515,7 +608,7 @@ mod tests {
             (PathBuf::from("a.pdf"), make("Smith")),
             (PathBuf::from("c.pdf"), make("Jones")),
         ];
-        let entries = format_entries(&results, false);
+        let entries = format_entries(&results, false, &HashSet::new());
         let keys: Vec<&str> = entries
             .iter()
             .map(|(_, entry)| entry.lines().next().unwrap())
@@ -538,14 +631,99 @@ mod tests {
             ..Biblio::default()
         };
         let results = vec![(PathBuf::from("papers/a.pdf"), biblio)];
-        let linked = format_entries(&results, true);
+        let linked = format_entries(&results, true, &HashSet::new());
         assert!(
             linked[0].1.contains("file = {papers/a.pdf},"),
             "{}",
             linked[0].1
         );
-        let plain = format_entries(&results, false);
+        let plain = format_entries(&results, false, &HashSet::new());
         assert!(!plain[0].1.contains("file = "), "{}", plain[0].1);
+    }
+
+    #[test]
+    fn test_format_entries_reserved_keys() {
+        let biblio = Biblio {
+            authors: vec![grobid::Author {
+                surname: Some("Smith".to_string()),
+                ..grobid::Author::default()
+            }],
+            date: Some("2020".to_string()),
+            ..Biblio::default()
+        };
+        let results = vec![(PathBuf::from("a.pdf"), biblio)];
+        // A key taken by an existing entry must not be reused: the new
+        // entry is suffixed instead.
+        let reserved: HashSet<String> = ["Smith2020".to_string()].into_iter().collect();
+        let entries = format_entries(&results, false, &reserved);
+        assert!(
+            entries[0].1.starts_with("@misc{Smith2020-2,"),
+            "{}",
+            entries[0].1
+        );
+        // Without the reservation the natural key is used.
+        let entries = format_entries(&results, false, &HashSet::new());
+        assert!(
+            entries[0].1.starts_with("@misc{Smith2020,"),
+            "{}",
+            entries[0].1
+        );
+    }
+
+    #[test]
+    fn test_merge_into_existing_file() {
+        let dir = std::env::temp_dir().join(format!("grobid-merge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("refs.bib");
+        // The existing entry ends with a single newline; the appended entry
+        // must be separated by one blank line.
+        std::fs::write(&path, "@misc{Smith2019,\n  title = {Existing},\n}\n")
+            .expect("write existing bib");
+
+        let reserved = parse_existing_keys(&path).expect("parse existing keys");
+        assert_eq!(reserved, HashSet::from(["Smith2019".to_string()]));
+
+        let biblio = Biblio {
+            authors: vec![grobid::Author {
+                surname: Some("Smith".to_string()),
+                ..grobid::Author::default()
+            }],
+            date: Some("2019".to_string()),
+            title: Some("Fresh".to_string()),
+            ..Biblio::default()
+        };
+        let results = vec![(PathBuf::from("a.pdf"), biblio)];
+        let entries = format_entries(&results, false, &reserved);
+        let bibtex = entries
+            .iter()
+            .map(|(_, entry)| entry.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        append_entries(&path, &bibtex).expect("append entries");
+
+        let merged = std::fs::read_to_string(&path).expect("read merged bib");
+        assert!(merged.starts_with("@misc{Smith2019,"), "{merged}");
+        assert!(merged.contains("}\n\n@misc{Smith2019-2,"), "{merged}");
+        assert!(merged.ends_with("}\n"), "{merged}");
+        // The merged file itself parses back without duplicate keys.
+        let bibliography = biblatex::Bibliography::parse(&merged).expect("parse merged bib");
+        assert_eq!(bibliography.len(), 2);
+        std::fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn test_append_entries_to_empty_file() {
+        let dir = std::env::temp_dir().join(format!("grobid-merge-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("refs.bib");
+        std::fs::write(&path, "").expect("write empty bib");
+        assert!(parse_existing_keys(&path).expect("parse").is_empty());
+        append_entries(&path, "@misc{a,\n}").expect("append to empty file");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "@misc{a,\n}\n"
+        );
+        std::fs::remove_dir_all(&dir).expect("remove temp dir");
     }
 
     #[test]

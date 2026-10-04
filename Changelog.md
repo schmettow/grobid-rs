@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `suggest_key` (omitted when no author or year yields one), every author
   with given and family name (falling back to the full name), the complete
   punctuation-stripped title, and the year at the end.
+- `pdf2bibtex`: `-m`/`--merge` appends the extracted entries to an existing
+  BibTeX file instead of writing a new one. The target file is parsed first
+  and its citation keys are reserved, so a new entry whose suggested key
+  already exists gets a `-2`, `-3`, ... suffix. `--merge` and `--output`
+  are mutually exclusive.
 
 ## v0.4.0
 
