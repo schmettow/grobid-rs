@@ -224,8 +224,10 @@ removed, and colliding names get a `-2`, `-3`, ... suffix. The same policy
 is available to library users as `bibtex::suggest_file_name()` and
 `bibtex::unique_path()`; `bibtex::FileStemStyle::Full` selects
 `Author1, Author2, ... - Year - Full title` with punctuation stripped and no
-title truncation, and `bibtex::unique_path_with_year()` resolves collisions
-by numbering the year (`... - 2020-1 - Title`).
+title truncation, `bibtex::FileStemStyle::Keyed` selects
+`<key> - <full authors> - <title> - <year>`, and
+`bibtex::unique_path_with_year()` resolves collisions by numbering the year
+(`... - 2020-1 - Title`).
 
 With `-l`/`--link`, each entry records the path of its PDF in a `file`
 field, so reference managers can open the document; combined with

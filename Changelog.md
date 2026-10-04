@@ -5,6 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v0.5.0
+
+### Added
+
+- `bibtex::FileStemStyle::Keyed` names files
+  `<key> - <full authors> - <full title> - <year>`: the citation key from
+  `suggest_key` (omitted when no author or year yields one), every author
+  with given and family name (falling back to the full name), the complete
+  punctuation-stripped title, and the year at the end.
+
 ## v0.4.0
 
 ### Changed

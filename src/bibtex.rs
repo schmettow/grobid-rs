@@ -173,6 +173,11 @@ pub enum FileStemStyle {
     /// and the complete title, joined with ` - `; every part is stripped of
     /// punctuation, and words stay separated by spaces.
     Full,
+    /// `<key> - <full authors> - <full title> - <year>` — the citation key
+    /// from [`suggest_key`] (omitted when it is the `"ref"` fallback or just
+    /// the year), every author with given and family name, the complete
+    /// title and the year, joined with ` - ` and stripped of punctuation.
+    Keyed,
 }
 
 /// Options for [`suggest_file_stem_with`] and [`suggest_file_name_with`].
@@ -181,7 +186,8 @@ pub struct FileStemOptions {
     /// How the stem is formatted; see [`FileStemStyle`].
     pub style: FileStemStyle,
     /// Maximum number of title words in [`FileStemStyle::Compact`]; ignored
-    /// by [`FileStemStyle::Full`]. `0` omits the title.
+    /// by [`FileStemStyle::Full`] and [`FileStemStyle::Keyed`]. `0` omits
+    /// the title.
     pub title_words: usize,
     /// Keep only ASCII alphanumerics, as [`suggest_key`] does (the default),
     /// or keep all Unicode alphanumerics. Punctuation and path separators
@@ -264,11 +270,24 @@ pub fn suggest_file_stem(biblio: &Biblio) -> Option<String> {
 ///     bibtex::suggest_file_stem_with(&biblio, &full).as_deref(),
 ///     Some("Milašauskienė - 2003 - Über die Müdigkeit")
 /// );
+///
+/// // The keyed style puts the (always ASCII) citation key first and the
+/// // year last.
+/// let keyed = FileStemOptions {
+///     style: FileStemStyle::Keyed,
+///     ascii_only: false,
+///     ..Default::default()
+/// };
+/// assert_eq!(
+///     bibtex::suggest_file_stem_with(&biblio, &keyed).as_deref(),
+///     Some("Milaauskien2003 - Milašauskienė - Über die Müdigkeit - 2003")
+/// );
 /// ```
 pub fn suggest_file_stem_with(biblio: &Biblio, options: &FileStemOptions) -> Option<String> {
     match options.style {
         FileStemStyle::Compact => compact_file_stem(biblio, options),
         FileStemStyle::Full => full_file_stem(biblio, options),
+        FileStemStyle::Keyed => keyed_file_stem(biblio, options),
     }
 }
 
@@ -334,6 +353,68 @@ fn full_file_stem(biblio: &Biblio, options: &FileStemOptions) -> Option<String> 
     } else {
         Some(stem)
     }
+}
+
+/// The `Key - Full authors - Full title - Year` stem.
+fn keyed_file_stem(biblio: &Biblio, options: &FileStemOptions) -> Option<String> {
+    let key = suggest_key(biblio);
+    let year = year(biblio).unwrap_or_default();
+    let mut parts: Vec<String> = Vec::new();
+    // `suggest_key` falls back to "ref" (no author or year) or degrades to
+    // the year alone (no author); neither adds information to the name.
+    if key != "ref" && key != year {
+        parts.push(key);
+    }
+    let authors = full_author_names(biblio, options.ascii_only);
+    if !authors.is_empty() {
+        parts.push(authors);
+    }
+    if let Some(title) = biblio
+        .title
+        .as_deref()
+        .map(|title| sanitize_words(title, options.ascii_only))
+        .filter(|title| !title.is_empty())
+    {
+        parts.push(title);
+    }
+    if !year.is_empty() {
+        parts.push(year);
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" - "))
+    }
+}
+
+/// Every author with given and family name, joined with `, `.  Authors
+/// without a structured name fall back to [`Author::full_name`]; authors
+/// without any name are dropped.
+fn full_author_names(biblio: &Biblio, ascii_only: bool) -> String {
+    biblio
+        .authors
+        .iter()
+        .filter_map(|author| {
+            let structured = [
+                author.given_name.as_deref(),
+                author.middle_name.as_deref(),
+                author.surname.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|part| !part.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+            let name = if structured.is_empty() {
+                author.full_name.as_deref().unwrap_or_default()
+            } else {
+                structured.as_str()
+            };
+            let name = sanitize_words(name, ascii_only);
+            (!name.is_empty()).then_some(name)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Suggest a file name for `path`: its directory and extension with the
@@ -1035,6 +1116,82 @@ mod tests {
             Some("2020 - One two three four five six seven eight nine ten eleven")
         );
         assert_eq!(suggest_file_stem_with(&Biblio::default(), &full), None);
+    }
+
+    #[test]
+    fn test_suggest_file_stem_keyed() {
+        let biblio = Biblio {
+            authors: vec![
+                author("Kahle", Some("Brewster")),
+                author("Smith", Some("Jane")),
+                // Without a structured name, the full name is used.
+                Author {
+                    full_name: Some("No Surname".to_string()),
+                    ..Author::default()
+                },
+                author("Milašauskienė", None),
+            ],
+            date: Some("2000-03-01".to_string()),
+            title: Some(
+                "The B.A.R.C. model: for continuous variables — an introduction!".to_string(),
+            ),
+            ..Biblio::default()
+        };
+        // Key first, year last; all authors with their full names.
+        let keyed_unicode = FileStemOptions {
+            style: FileStemStyle::Keyed,
+            ascii_only: false,
+            ..FileStemOptions::default()
+        };
+        assert_eq!(
+            suggest_file_stem_with(&biblio, &keyed_unicode).as_deref(),
+            Some(
+                "Kahle2000 - Brewster Kahle, Jane Smith, No Surname, Milašauskienė - \
+                 The BARC model for continuous variables an introduction - 2000"
+            )
+        );
+        // The citation key stays ASCII; the Unicode policy only affects
+        // authors and title.
+        let keyed_ascii = FileStemOptions {
+            style: FileStemStyle::Keyed,
+            ..FileStemOptions::default()
+        };
+        assert_eq!(
+            suggest_file_stem_with(&biblio, &keyed_ascii).as_deref(),
+            Some(
+                "Kahle2000 - Brewster Kahle, Jane Smith, No Surname, Milaauskien - \
+                 The BARC model for continuous variables an introduction - 2000"
+            )
+        );
+    }
+
+    #[test]
+    fn test_keyed_style_omits_missing_parts() {
+        let keyed = FileStemOptions {
+            style: FileStemStyle::Keyed,
+            ..FileStemOptions::default()
+        };
+        // No author or year means no key: the title alone is used.
+        let biblio = Biblio {
+            title: Some("A title".to_string()),
+            ..Biblio::default()
+        };
+        assert_eq!(
+            suggest_file_stem_with(&biblio, &keyed).as_deref(),
+            Some("A title")
+        );
+        // Author and year, but no title.
+        let biblio = Biblio {
+            authors: vec![author("Smith", Some("Jane"))],
+            date: Some("2020".to_string()),
+            ..Biblio::default()
+        };
+        assert_eq!(
+            suggest_file_stem_with(&biblio, &keyed).as_deref(),
+            Some("Smith2020 - Jane Smith - 2020")
+        );
+        // Nothing usable.
+        assert_eq!(suggest_file_stem_with(&Biblio::default(), &keyed), None);
     }
 
     #[test]
