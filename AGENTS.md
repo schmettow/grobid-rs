@@ -14,14 +14,15 @@ scoped bullet points naming the files or modules touched. Do **not** run
 
 - This repository is a **library** crate (package `grobid`): a client for
   the GROBID REST API with a strongly typed TEI parser. It has no binaries
-  of its own; the `examples/` are reference implementations.
+  of its own; the BibTeX helpers and the `pdf2bibtex`/`refs2bibtex` tools
+  live in the companion crate `grobid-bibtex`.
 - MSRV is Rust 1.85 (declared in `Cargo.toml`), edition 2021.
 - `Cargo.lock` is intentionally not tracked — it is a library.
 - `AGENTS.md` is excluded from the published crate (`exclude` in
   `Cargo.toml`): it lives on GitHub only.
 - Before finishing a change, run and keep warning-free:
   `cargo fmt --check`, `cargo clippy --all-targets`, `cargo test`,
-  `cargo test --examples`, `cargo doc --no-deps`.
+  `cargo doc --no-deps`.
 - Documentation is enforced via `#![warn(missing_docs)]`; keep `# Errors` /
   `# Panics` sections on public fallible functions up to date.
 - Tests that need a GROBID server use the in-process mock server in

@@ -58,7 +58,6 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
 
-use crate::bibtex;
 use crate::tei::{Author, Biblio};
 
 /// The public OpenAlex API, used by [`Completer::new`].
@@ -684,7 +683,14 @@ fn normalize_title(raw: &str) -> String {
 
 /// The parsed publication year, when there is a usable one.
 fn parsed_year(biblio: &Biblio) -> Option<u32> {
-    bibtex::year(biblio).and_then(|year| year.parse::<u32>().ok())
+    let digits: String = biblio
+        .date
+        .as_deref()?
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .take(4)
+        .collect();
+    digits.parse().ok()
 }
 
 /// Whether the parsed publication year is compatible with the work's year.

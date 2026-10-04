@@ -204,82 +204,16 @@ the first page numbered 1. See the
 [GROBID documentation](https://grobid.readthedocs.io/en/latest/Coordinates-in-PDF/)
 for details.
 
-## Examples
+## Examples and command-line tools
 
-### pdf2bibtex
-
-The `pdf2bibtex` example processes all PDFs in a directory and writes the
-extracted bibliographic metadata as a BibTeX file, one entry per document
-(its header):
-
-```sh
-cargo run --release --example pdf2bibtex -- ~/papers -s http://localhost:8070
-```
-
-With `-r`/`--rename`, each PDF is renamed after its metadata has been
-extracted to `Author_Year_<first 10 title words>.pdf`, e.g.
-`Kahle_2000_The_Barc_model_for_continuous_variables.pdf`. Parts GROBID could
-not extract (author, year or title) are dropped, non-ASCII characters are
-removed, and colliding names get a `-2`, `-3`, ... suffix. The same policy
-is available to library users as `bibtex::suggest_file_name()` and
-`bibtex::unique_path()`; `bibtex::FileStemStyle::Full` selects
-`Author1, Author2, ... - Year - Full title` with punctuation stripped and no
-title truncation, `bibtex::FileStemStyle::Keyed` selects
-`<key> - <full authors> - <title> - <year>`, and
-`bibtex::unique_path_with_year()` resolves collisions by numbering the year
-(`... - 2020-1 - Title`).
-
-With `-l`/`--link`, each entry records the path of its PDF in a `file`
-field, so reference managers can open the document; combined with
-`-r`/`--rename`, the field points at the renamed file. Paths are recorded
-as passed on the command line, so relative input paths stay relative.
-
-With `-a`/`--append` or `-m`/`--merge`, the entries go into an existing
-BibTeX file instead of a new one. Both parse the file first and reserve
-its citation keys, so a new entry whose suggested key already exists gets
-a `-2`, `-3`, ... suffix. `--append` adds every extracted entry;
-`--merge` skips records that are already there, where a record counts as
-present when its normalized field content, one of its identifiers (DOI,
-PMID, arXiv) or its PDF file name matches an existing entry. `--output`,
-`--append` and `--merge` are mutually exclusive.
-
-With `--openalex` (requires building the example with `--features openalex`),
-each extracted header is completed against OpenAlex before entries are
-written and PDFs are renamed: missing authors, journal, volume, pages, DOI,
-... are filled in from the matching work. See *Reference completion against
-OpenAlex* above.
-
-### refs2bibtex
-
-The `refs2bibtex` example extracts the bibliographic *references* of all PDFs
-in a directory (via `/api/processReferences`) and writes one BibTeX entry per
-reference:
-
-```sh
-cargo run --release --example refs2bibtex -- ~/papers -s http://localhost:8070
-```
-
-Both examples discover PDFs recursively and process them with a bounded
-number of concurrent requests (`-w`, default 4); per-document failures are
-reported on stderr and skipped, and an unresponsive server is detected by a
-liveness probe with bounded retries and a clear error message. Entry types
-(`@article`, `@incollection`, `@techreport`, `@book`, `@misc`) and keys
-(first author surname + year, deduplicated) are derived from the parsed
-metadata via the `grobid::bibtex` helpers, which render records as typed
-BibLaTeX entries using the [`biblatex`](https://crates.io/crates/biblatex)
-crate (proper escaping, typed person lists and dates). `refs2bibtex` skips
-empty parse results and drops references with a duplicate DOI, and supports
-reference consolidation against CrossRef with `-c/--consolidate`. Both examples
-accept `--openalex` when built with `--features openalex`: `refs2bibtex`
-completes the collected references, `pdf2bibtex` each document header, before
-the entries are written (see *Reference completion against OpenAlex* above):
-
-```sh
-cargo run --release --features openalex --example refs2bibtex -- ~/papers --openalex
-cargo run --release --features openalex --example pdf2bibtex -- ~/papers --openalex
-```
-
-Run either example with `--help` for all options.
+The BibTeX examples moved to the companion crate
+[`grobid-bibtex`](https://github.com/schmettow/grobid-bibtex): its
+`pdf2bibtex` binary processes the headers of all PDFs in a directory and
+its `refs2bibtex` binary extracts their references, both writing
+BibTeX/BibLaTeX files. That crate also hosts the BibTeX helpers
+(`bibtex::format_entry`, `bibtex::suggest_key`, the file-naming policies
+and merging into existing bibliographies) that were formerly
+`grobid::bibtex`.
 
 ## The GROBID server
 

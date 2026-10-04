@@ -24,13 +24,14 @@ Revisit the decision when the feature grows beyond a thin completion tier:
 - whatever the outcome, keep the public `openalex::Completer` API stable and
   swap only the internals.
 
-## 2. Grow the CLI examples before splitting them out
+## 2. Grow the CLI tools in the companion crate
 
-`pdf2bibtex` and `refs2bibtex` are reference implementations in `examples/`.
-Develop them there first — more options, better progress output, clearer
-error reporting, additional heuristics — so that the library API is shaped by
-real command-line needs. Only then move them into their own crate; until
-then, every new option is a cheap experiment.
+Done: `pdf2bibtex` and `refs2bibtex` moved to the companion crate
+[`grobid-bibtex`](https://github.com/schmettow/grobid-bibtex) as binaries,
+together with the BibTeX helpers formerly in `grobid::bibtex`. Continue
+growing them there — more options, better progress output, additional
+heuristics — and feed what turns out to be general-purpose back into the
+`grobid-bibtex` library API.
 
 ## 3. Ragrig connector
 

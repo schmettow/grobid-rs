@@ -16,6 +16,10 @@
 //! * optional second-tier completion of parsed references against OpenAlex
 //!   (`openalex` feature).
 //!
+//! BibTeX/BibLaTeX rendering and bibliography tooling moved to the
+//! companion crate [`grobid-bibtex`](https://crates.io/crates/grobid-bibtex),
+//! together with the `pdf2bibtex` and `refs2bibtex` command-line tools.
+//!
 //! ## Example
 //!
 //! ```no_run
@@ -78,7 +82,6 @@
 #![warn(clippy::missing_errors_doc)]
 #![warn(clippy::missing_panics_doc)]
 
-pub mod bibtex;
 mod client;
 mod error;
 #[cfg(feature = "openalex")]
