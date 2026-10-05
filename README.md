@@ -152,8 +152,6 @@ With the `openalex` feature, parsed references can be completed against
 [OpenAlex](https://openalex.org/): a reference is looked up by DOI when one
 was parsed, otherwise by title, and missing fields — authors, journal, volume,
 pages, DOI, PubMed ID, ... — are filled in from the matching work. Existing
-requirement): a reference is looked up by DOI when one was parsed, otherwise by
-title, and missing fields are filled in from the matching work. Existing
 fields are never overwritten, and a search result is accepted only when
 title, publication year and first author are compatible with the parsed
 reference. Lookups require HTTPS access to `api.openalex.org`; they use the
@@ -171,7 +169,7 @@ stall a batch.
 Enable the feature in `Cargo.toml`:
 
 ```toml
-grobid = { version = "0.2", features = ["openalex"] }
+grobid = { version = "0.6", features = ["openalex"] }
 ```
 
 ```rust,ignore

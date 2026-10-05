@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## v0.6.0
 
-## Removed
+### Removed
 
 - src/bibtex.rs: moved to grobid-bibtex, together with the pdf2bibtex
   and refs2bibtex examples (now binaries there)
@@ -15,6 +15,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - src/openalex.rs: derive the publication year locally instead of via
   the removed bibtex::year helper
 - Cargo.toml: drop the biblatex dependency
+
+### Quality
+
+- **Test coverage** (`cargo llvm-cov --all-features`; unit and integration
+  tests, doctests are not measured on stable Rust): `openalex.rs` 93.5%,
+  `tei/parse.rs` 90.7%, `error.rs` 83.3%, `client.rs` 82.2% and
+  `tei/model.rs` 75.3% line coverage — 89.4% across the crate.
+- **Verification**: `cargo fmt --check`, `cargo check --all-targets
+  --all-features`, `cargo clippy --all-targets --all-features --
+  -D warnings` and `cargo test --all-features` all pass: 32 library unit
+  tests (9 intentionally `#[ignore]`d tests pin known OpenAlex matching
+  weaknesses), 44 integration tests (`tests/client.rs` 21, `tests/openalex.rs`
+  14, `tests/parse.rs` 9) and 35 doctests (1 ignored OpenAlex example).
+  Against a live GROBID server at `http://localhost:8070` (version 0.9.1)
+  the client parsed a 5-author article with 49 references and a 2-author
+  article with 27 references via `process_fulltext_document` and
+  `process_references`.
 
 ## v0.5.0
 
