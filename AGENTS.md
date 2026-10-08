@@ -35,6 +35,7 @@ those are maintained separately.
 4. Update the package metadata in `Cargo.toml`: version, description,
    keywords, categories, repository and readme. Leave the documentation
    metadata alone (see above).
+5. Sometimes two crates are developed alongside, but must be published in order. Check for local paths in `Cargo.toml`. If local paths exist, check whether the co-developed crate is in your workspace. Check the publication status of all crates in the workspace and return to the user with a publication plan.
 
 ## Project notes
 
